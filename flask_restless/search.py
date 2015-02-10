@@ -21,9 +21,10 @@ from sqlalchemy import or_
 from sqlalchemy.ext.associationproxy import AssociationProxy
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 
-from .helpers import session_query
+from .helpers import get_related_model
 from .helpers import get_related_association_proxy_model
 from .helpers import primary_key_names
+from .helpers import session_query
 
 
 def _sub_operator(model, argument, fieldname):
@@ -444,7 +445,7 @@ class QueryBuilder(object):
         return or_(create_filt(model, f) for f in filt)
 
     @staticmethod
-    def create_query(session, model, search_params, _ignore_order_by=False):
+    def create_query(session, model, sort=None, _ignore_order_by=False):
         """Builds an SQLAlchemy query instance based on the search parameters
         present in ``search_params``, an instance of :class:`SearchParameters`.
 
@@ -474,82 +475,81 @@ class QueryBuilder(object):
 
         """
         query = session_query(session, model)
-        # For the sake of brevity, rename this method.
-        create_filt = QueryBuilder._create_filter
-        # This function call may raise an exception.
-        filters = [create_filt(model, filt) for filt in search_params.filters]
-        # Multiple filter criteria at the top level of the provided search
-        # parameters are interpreted as a conjunction (AND).
-        query = query.filter(*filters)
+        # # For the sake of brevity, rename this method.
+        # create_filt = QueryBuilder._create_filter
+        # # This function call may raise an exception.
+        # filters = [create_filt(model, filt) for filt in search_params.filters]
+        # # Multiple filter criteria at the top level of the provided search
+        # # parameters are interpreted as a conjunction (AND).
+        # query = query.filter(*filters)
 
         # Order the search. If no order field is specified in the search
         # parameters, order by primary key.
         if not _ignore_order_by:
-            if search_params.order_by:
-                for val in search_params.order_by:
-                    field_name = val.field
-                    if '__' in field_name:
+            if sort:
+                for (symbol, field_name) in sort:
+                    direction_name = 'asc' if symbol is '+' else 'desc'
+                    if '.' in field_name:
                         field_name, field_name_in_relation = \
-                            field_name.split('__')
+                            field_name.split('.')
                         relation = getattr(model, field_name)
-                        relation_model = relation.mapper.class_
+                        relation_model = get_related_model(model, field_name)
                         field = getattr(relation_model, field_name_in_relation)
-                        direction = getattr(field, val.direction)
+                        direction = getattr(field, direction_name)
                         query = query.join(relation_model)
                         query = query.order_by(direction())
                     else:
-                        field = getattr(model, val.field)
-                        direction = getattr(field, val.direction)
+                        field = getattr(model, field_name)
+                        direction = getattr(field, direction_name)
                         query = query.order_by(direction())
             else:
                 pks = primary_key_names(model)
                 pk_order = (getattr(model, field).asc() for field in pks)
                 query = query.order_by(*pk_order)
 
-        # Group the query.
-        if search_params.group_by:
-            for groupby in search_params.group_by:
-                field = getattr(model, groupby.field)
-                query = query.group_by(field)
+        # # Group the query.
+        # if search_params.group_by:
+        #     for groupby in search_params.group_by:
+        #         field = getattr(model, groupby.field)
+        #         query = query.group_by(field)
 
-        # Apply limit and offset to the query.
-        if search_params.limit:
-            query = query.limit(search_params.limit)
-        if search_params.offset:
-            query = query.offset(search_params.offset)
+        # # Apply limit and offset to the query.
+        # if search_params.limit:
+        #     query = query.limit(search_params.limit)
+        # if search_params.offset:
+        #     query = query.offset(search_params.offset)
 
         return query
 
 
-def create_query(session, model, searchparams, _ignore_order_by=False):
-    """Returns a SQLAlchemy query object on the given `model` where the search
-    for the query is defined by `searchparams`.
+# def create_query(session, model, sort, _ignore_order_by=False):
+#     """Returns a SQLAlchemy query object on the given `model` where the search
+#     for the query is defined by `searchparams`.
 
-    The returned query matches the set of all instances of `model` which meet
-    the parameters of the search given by `searchparams`. For more information
-    on search parameters, see :ref:`search`.
+#     The returned query matches the set of all instances of `model` which meet
+#     the parameters of the search given by `searchparams`. For more information
+#     on search parameters, see :ref:`search`.
 
-    `model` is a SQLAlchemy declarative model representing the database model
-    to query.
+#     `model` is a SQLAlchemy declarative model representing the database model
+#     to query.
 
-    `searchparams` is either a dictionary (as parsed from a JSON request from
-    the client, for example) or a :class:`SearchParameters` instance defining
-    the parameters of the query (as returned by
-    :func:`SearchParameters.from_dictionary`, for example).
+#     `searchparams` is either a dictionary (as parsed from a JSON request from
+#     the client, for example) or a :class:`SearchParameters` instance defining
+#     the parameters of the query (as returned by
+#     :func:`SearchParameters.from_dictionary`, for example).
 
-    If `_ignore_order_by` is ``True``, no ``order_by`` method will be called on
-    the query, regardless of whether the search parameters indicate that there
-    should be an ``order_by``. (This is used internally by Flask-Restless to
-    work around a limitation in SQLAlchemy.)
+#     If `_ignore_order_by` is ``True``, no ``order_by`` method will be called on
+#     the query, regardless of whether the search parameters indicate that there
+#     should be an ``order_by``. (This is used internally by Flask-Restless to
+#     work around a limitation in SQLAlchemy.)
 
-    """
-    if isinstance(searchparams, dict):
-        searchparams = SearchParameters.from_dictionary(searchparams)
-    return QueryBuilder.create_query(session, model, searchparams,
-                                     _ignore_order_by)
+#     """
+#     # if isinstance(searchparams, dict):
+#     #     searchparams = SearchParameters.from_dictionary(searchparams)
+#     return QueryBuilder.create_query(session, model, sort, _ignore_order_by)
 
 
-def search(session, model, search_params, _ignore_order_by=False):
+def search(session, model, sort=None, single=False, _ignore_order_by=False):
     """Performs the search specified by the given parameters on the model
     specified in the constructor of this class.
 
@@ -568,6 +568,11 @@ def search(session, model, search_params, _ignore_order_by=False):
     `model` is a SQLAlchemy declarative model class representing the database
     model to query.
 
+    `sort` is a list of two-tuples of the form ``(direction, fieldname)``,
+    where ``direction`` is either ``'+'`` or ``'-'`` and ``fieldname`` is a
+    string representing an attribute of the model or a dot-separated
+    relationship path (for example, ``'owner.name'``).
+
     `search_params` is a dictionary containing all available search
     parameters. For more information on available search parameters, see
     :ref:`search`. Implementation note: this dictionary will be converted to a
@@ -580,12 +585,12 @@ def search(session, model, search_params, _ignore_order_by=False):
     work around a limitation in SQLAlchemy.)
 
     """
-    # `is_single` is True when 'single' is a key in ``search_params`` and its
-    # corresponding value is anything except those values which evaluate to
-    # False (False, 0, the empty string, the empty list, etc.).
-    is_single = search_params.get('single')
-    query = create_query(session, model, search_params, _ignore_order_by)
-    if is_single:
+    # # `is_single` is True when 'single' is a key in ``search_params`` and its
+    # # corresponding value is anything except those values which evaluate to
+    # # False (False, 0, the empty string, the empty list, etc.).
+    # is_single = search_params.get('single')
+    query = QueryBuilder.create_query(session, model, sort, _ignore_order_by)
+    if single:
         # may raise NoResultFound or MultipleResultsFound
         return query.one()
     return query

@@ -321,43 +321,31 @@ class TestAPI(TestSupport):
         # to facilitate searching
         self.app.search = lambda url, q: self.app.get(url + '?q={0}'.format(q))
 
-    def test_post(self):
-        """Test for creating a new instance of the database model using the
-        :http:method:`post` method.
-
-        """
+    def test_post_invalid_json(self):
         # Invalid JSON in request data should respond with error.
         response = self.app.post('/api/person', data='Invalid JSON string')
         assert response.status_code == 400
         assert loads(response.data)['message'] == 'Unable to decode data'
 
-        # Now, let's test the validation stuff
-        # response = self.app.post('/api/person', data=dumps({'name': u'Test',
-        #                                                      'age': 'oi'}))
-        # assert loads(response.data)['message'] == 'Validation error'
-        # assert loads(response.data)['error_list'].keys() == ['age']
-
-        # Test the integrity exception by violating the unique 'name' field
-        # of person
-        response = self.app.post('/api/person',
-                                 data=dumps({'name': u'George', 'age': 23}))
+    def test_post_integrity_error(self):
+        # Test the integrity exception by violating the unique 'name' field of
+        # the Person model.
+        person = dict(name=u'foo')
+        response = self.app.post('/api/person', data=dumps(person))
         assert response.status_code == 201
-
-        # This errors as expected
-        response = self.app.post('/api/person',
-                                 data=dumps({'name': u'George', 'age': 23}))
+        response = self.app.post('/api/person', data=dumps(person))
         assert response.status_code == 400
-        assert json.loads(response.data)['message'] == 'IntegrityError'
+        assert loads(response.data)['message'] == 'IntegrityError'
         assert self.session.is_active, "Session is in `partial rollback` state"
 
         # For issue #158 we make sure that the previous failure is rolled back
         # so that we can add valid entries again
-        response = self.app.post('/api/person',
-                                 data=dumps({'name': u'Benjamin', 'age': 23}))
+        person = dict(name=u'bar')
+        response = self.app.post('/api/person', data=dumps(person))
         assert response.status_code == 201
-
-        response = self.app.post('/api/person',
-                                 data=dumps({'name': u'Lincoln', 'age': 23}))
+        assert 'id' in loads(response.data)
+        person = dict(name=u'bar')
+        response = self.app.post('/api/person', data=dumps(person))
         assert response.status_code == 201
         assert 'id' in loads(response.data)
 
@@ -1208,45 +1196,51 @@ class TestAPI(TestSupport):
 
         response = self.app.get('/api/person')
         assert response.status_code == 200
-        assert loads(response.data)['page'] == 1
-        assert len(loads(response.data)['objects']) == 10
-        assert loads(response.data)['total_pages'] == 3
+        data = loads(response.data)
+        assert data['meta']['page'] == 1
+        assert len(data['objects']) == 10
+        assert data['meta']['total_pages'] == 3
 
         response = self.app.get('/api/person?page=1')
         assert response.status_code == 200
-        assert loads(response.data)['page'] == 1
-        assert len(loads(response.data)['objects']) == 10
-        assert loads(response.data)['total_pages'] == 3
+        data = loads(response.data)
+        assert data['meta']['page'] == 1
+        assert len(data['objects']) == 10
+        assert data['meta']['total_pages'] == 3
 
         response = self.app.get('/api/person?page=2')
         assert response.status_code == 200
-        assert loads(response.data)['page'] == 2
-        assert len(loads(response.data)['objects']) == 10
-        assert loads(response.data)['total_pages'] == 3
+        data = loads(response.data)
+        assert data['meta']['page'] == 2
+        assert len(data['objects']) == 10
+        assert data['meta']['total_pages'] == 3
 
         response = self.app.get('/api/person?page=3')
         assert response.status_code == 200
-        assert loads(response.data)['page'] == 3
-        assert len(loads(response.data)['objects']) == 5
-        assert loads(response.data)['total_pages'] == 3
+        data = loads(response.data)
+        assert data['meta']['page'] == 3
+        assert len(data['objects']) == 5
+        assert data['meta']['total_pages'] == 3
 
         response = self.app.get('/api/v2/person?page=3')
         assert response.status_code == 200
-        assert loads(response.data)['page'] == 3
-        assert len(loads(response.data)['objects']) == 5
-        assert loads(response.data)['total_pages'] == 5
+        data = loads(response.data)
+        assert data['meta']['page'] == 3
+        assert len(data['objects']) == 5
+        assert data['meta']['total_pages'] == 5
 
         response = self.app.get('/api/v3/person')
         assert response.status_code == 200
-        assert loads(response.data)['page'] == 1
-        assert len(loads(response.data)['objects']) == 25
-        assert loads(response.data)['total_pages'] == 1
+        data = loads(response.data)
+        assert data['meta']['page'] == 1
+        assert len(data['objects']) == 25
+        assert data['meta']['total_pages'] == 1
 
         response = self.app.get('/api/v3/person?page=2')
-        assert response.status_code == 200
-        assert loads(response.data)['page'] == 1
-        assert len(loads(response.data)['objects']) == 25
-        assert loads(response.data)['total_pages'] == 1
+        data = loads(response.data)
+        assert data['meta']['page'] == 1
+        assert len(data['objects']) == 25
+        assert data['meta']['total_pages'] == 1
 
     def test_num_results(self):
         """Tests that a request for (a subset of) all instances of a model
@@ -1261,8 +1255,7 @@ class TestAPI(TestSupport):
         response = self.app.get('/api/person')
         assert response.status_code == 200
         data = loads(response.data)
-        assert 'num_results' in data
-        assert data['num_results'] == 15
+        assert data['meta']['num_results'] == 15
 
     def test_alternate_primary_key(self):
         """Tests that models with primary keys which are not ``id`` columns are
@@ -1608,7 +1601,7 @@ class TestHeaders(TestSupportPrefilled):
         response = self.app.get('/api/person/1', content_type=None)
         assert 200 == response.status_code
         response = self.app.get('/api/person/1',
-                                content_type='application/json')
+                                content_type='application/vnd.api+json')
         assert 200 == response.status_code
         # A request that requires a body but without a Content-Type header
         # should produce an error (specifically, error 415 Unsupported media
@@ -1617,11 +1610,11 @@ class TestHeaders(TestSupportPrefilled):
                                  content_type=None)
         assert 415 == response.status_code
         response = self.app.post('/api/person', data=dumps(dict(name='foo')),
-                                 content_type='application/json')
+                                 content_type='application/vnd.api+json')
         assert 201 == response.status_code
         # A request without an Accept header should return JSON.
         assert 'Content-Type' in response.headers
-        assert 'application/json' == response.headers['Content-Type']
+        assert 'application/vnd.api+json' == response.headers['Content-Type']
         assert 'foo' == loads(response.data)['name']
         response = self.app.post('/api/person', data=dumps(dict(name='foo')),
                                  content_type=None)
@@ -1631,16 +1624,16 @@ class TestHeaders(TestSupportPrefilled):
                                   content_type=None)
         assert 415 == response.status_code
         response = self.app.patch('/api/person/6', data=dumps(dict(name='x')),
-                                  content_type='application/json')
+                                  content_type='application/vnd.api+json')
         assert 200 == response.status_code
-        content_type = 'application/json; charset=UTF-8'
+        content_type = 'application/vnd.api+json; charset=UTF-8'
         response = self.app.patch('/api/person/6', data=dumps(dict(name='x')),
                                   content_type=content_type)
         assert 200 == response.status_code
 
         # A request without an Accept header should return JSON.
         assert 'Content-Type' in response.headers
-        assert 'application/json' == response.headers['Content-Type']
+        assert 'application/vnd.api+json' == response.headers['Content-Type']
         assert 'x' == loads(response.data)['name']
 
     def test_content_type_msie(self):
@@ -1695,13 +1688,13 @@ class TestHeaders(TestSupportPrefilled):
         response = self.app.get('/api/person/1', headers=headers)
         assert 200 == response.status_code
         assert 'Content-Type' in response.headers
-        assert 'application/json' == response.headers['Content-Type']
+        assert 'application/vnd.api+json' == response.headers['Content-Type']
         assert 1 == loads(response.data)['id']
-        headers = dict(Accept='application/json')
+        headers = dict(Accept='application/vnd.api+json')
         response = self.app.get('/api/person/1', headers=headers)
         assert 200 == response.status_code
         assert 'Content-Type' in response.headers
-        assert 'application/json' == response.headers['Content-Type']
+        assert 'application/vnd.api+json' == response.headers['Content-Type']
         assert 1 == loads(response.data)['id']
         # Check for accepting XML.
         # headers = dict(Accept='application/xml')

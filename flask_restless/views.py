@@ -26,6 +26,7 @@ from __future__ import division
 
 from collections import defaultdict
 from functools import wraps
+from itertools import chain
 import math
 import warnings
 
@@ -42,31 +43,36 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.associationproxy import AssociationProxy
 from sqlalchemy.orm.attributes import InstrumentedAttribute
+from sqlalchemy.orm.exc import FlushError
 from sqlalchemy.orm.exc import MultipleResultsFound
 from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.orm.query import Query
 from werkzeug.exceptions import BadRequest
 from werkzeug.exceptions import HTTPException
-from werkzeug.urls import url_quote_plus
 
+from .helpers import collection_name
 from .helpers import count
 from .helpers import evaluate_functions
 from .helpers import get_by
 from .helpers import get_columns
+from .helpers import get_model
 from .helpers import get_or_create
 from .helpers import get_related_model
 from .helpers import get_relations
 from .helpers import has_field
 from .helpers import is_like_list
+from .helpers import model_for
 from .helpers import partition
 from .helpers import primary_key_name
+from .helpers import primary_key_value
 from .helpers import query_by_primary_key
 from .helpers import session_query
 from .helpers import strings_to_dates
 from .helpers import to_dict
 from .helpers import upper_keys
+from .helpers import url_for
 from .helpers import get_related_association_proxy_model
-from .search import create_query
+#from .search import create_query
 from .search import search
 
 
@@ -80,6 +86,15 @@ _HEADERS = '__restless_headers'
 #: String used internally as a dictionary key for passing status code
 #: information from view functions to the :func:`jsonpify` function.
 _STATUS = '__restless_status_code'
+
+#: The Content-Type we expect for most requests to APIs.
+CONTENT_TYPE = 'application/vnd.api+json'
+
+#: SQLAlchemy errors that, when caught, trigger a rollback of the session.
+ROLLBACK_ERRORS = (DataError, IntegrityError, ProgrammingError, FlushError)
+
+# For the sake of brevity, rename this function.
+chain = chain.from_iterable
 
 
 class ProcessingException(HTTPException):
@@ -129,6 +144,14 @@ def _is_msie8or9():
             and (8, 0) <= version(request.user_agent) < (10, 0))
 
 
+def dict_union(d1, d2):
+    result = defaultdict(set)
+    for k, v in chain(d1.items(), d2.items()):
+        result[k] |= v
+    # Don't want the returned object to be a defaultdict.
+    return dict(result)
+
+
 def create_link_string(page, last_page, per_page):
     """Returns a string representing the value of the ``Link`` header.
 
@@ -163,6 +186,13 @@ def catch_processing_exceptions(func):
     return decorator
 
 
+# def add_self_link(data, model, *args, **kw):
+#     # The remaining args and keywords go directly to url_for
+#     if 'links' not in data:
+#         data['links'] = {}
+#     data['links']['self'] = url_for(model, *args, **kw)
+
+
 def catch_integrity_errors(session):
     """Returns a decorator that catches database integrity errors.
 
@@ -188,12 +218,23 @@ def catch_integrity_errors(session):
             try:
                 return func(*args, **kw)
             # TODO should `sqlalchemy.exc.InvalidRequestError`s also be caught?
-            except (DataError, IntegrityError, ProgrammingError) as exception:
+            except ROLLBACK_ERRORS as exception:
                 session.rollback()
                 current_app.logger.exception(str(exception))
-                return dict(message=type(exception).__name__), 400
+                # Special status code for conflicting instances: 409 Conflict
+                status = 409 if is_conflict(exception) else 400
+                return dict(message=type(exception).__name__), status
         return wrapped
     return decorator
+
+
+def is_conflict(exception):
+    """Returns ``True`` if and only if the specified exception represents a
+    conflict in the database.
+
+    """
+    string = str(exception)
+    return 'conflicts with' in string or 'UNIQUE constraint failed' in string
 
 
 def set_headers(response, headers):
@@ -358,6 +399,14 @@ def _parse_includes(column_names):
     return columns, relations
 
 
+def parse_sparse_fields():
+    # TODO use a regular expression to ensure field parameters are of the
+    # correct format? (maybe ``field\[[^\[\]\.]*\]``)
+    return {key[7:-1]: set(value.split(','))
+            for key, value in request.args.items()
+            if key.startswith('fields[') and key.endswith(']')}
+
+
 def _parse_excludes(column_names):
     """Returns a pair, consisting of a list of column names to exclude on the
     left and a dictionary mapping relation name to a list containing the names
@@ -386,6 +435,7 @@ def _parse_excludes(column_names):
     return columns, relations
 
 
+# TODO these need to become JSON Pointers
 def extract_error_messages(exception):
     """Tries to extract a dictionary mapping field name to validation error
     messages from `exception`, which is a validation exception as provided in
@@ -417,6 +467,81 @@ def extract_error_messages(exception):
         fieldname = left[left_bracket + 1:].strip()
         return {fieldname: msg}
     return None
+
+
+def error(id=None, href=None, status=None, code=None, title=None,
+          detail=None, links=None, paths=None):
+    # HACK We use locals() so we don't have to list every keyword argument.
+    if all(kwvalue is None for kwvalue in locals().values()):
+        raise ValueError('At least one of the arguments must not be None.')
+    return dict(id=id, href=href, status=status, code=code, title=title,
+                detail=detail, links=links, paths=paths)
+
+
+def error_response(status, **kw):
+    """Returns a correctly formatted error response with the specified
+    parameters.
+
+    This is a convenience function for::
+
+        errors_response(status, [error(**kw)])
+
+    For more information, see :func:`errors_response`.
+
+    """
+    return errors_response(status, [error(**kw)])
+
+
+def errors_response(status, errors):
+    """Return an error response with multiple errors.
+
+    `status` is an integer representing an HTTP status code corresponding to an
+    error response.
+
+    `errors` is a list of error dictionaries, each of which must satisfy the
+    requirements of the JSON API specification.
+
+    This function returns a two-tuple whose left element is a dictionary
+    containing the errors under the top-level key ``errors`` and whose right
+    element is `status`.
+
+    The returned dictionary object also includes a key with a special name,
+    stored in the key :data:`_STATUS`, which is used to workaround an
+    incompatibility between Flask and mimerender that doesn't allow setting
+    headers on a global response object.
+
+    The keys within each error object are described in the `Errors`_ section of
+    the JSON API specification.
+
+    .. _Errors: http://jsonapi.org/format/#errors
+
+    """
+    return {'errors': errors, _STATUS: status}, status
+
+
+# def linked_resources(resource):
+#     """Returns an iterator over (type, id) pairs for each resource linked to
+#     the specified resource.
+
+#     `resource` is a dictionary representation of a SQLAlchemy instance, as
+#     would be returned on a :http:method:`get` request for a single instance of
+#     a model.
+
+#     `resource` must have a ``'links'`` mapping containing link objects, each of
+#     which must have either an ``'id'`` or an ``'ids'`` mapping.
+
+#     """
+#     # Iterate over each link object and collect the IDs of each one.
+#     for link_object in resource['links'].values():
+#         type_ = link_object['type']
+#         if 'ids' in link_object:
+#             for id_ in link_object['ids']:
+#                 yield type_, id_
+#         elif 'id' in link_object:
+#             yield type_, link_object['id']
+#         else:
+#             raise ValueError('Link object must have an "id" or "ids" key.')
+
 
 #: Creates the mimerender object necessary for decorating responses with a
 #: function that automatically formats the dictionary in the appropriate format
@@ -514,7 +639,51 @@ class FunctionAPI(ModelView):
             return dict(message=message), 400
 
 
-class API(ModelView):
+class APIBase(ModelView):
+
+    #: List of decorators applied to every method of this class.
+    decorators = ModelView.decorators + [catch_processing_exceptions]
+
+    def __init__(self, session, model, preprocessors=None, postprocessors=None,
+                 primary_key=None, validation_exceptions=None,
+                 allow_to_many_replacement=None, *args, **kw):
+        super(APIBase, self).__init__(session, model, *args, **kw)
+        self.allow_to_many_replacement = allow_to_many_replacement
+        self.validation_exceptions = tuple(validation_exceptions or ())
+        self.primary_key = primary_key
+        self.postprocessors = defaultdict(list)
+        self.preprocessors = defaultdict(list)
+        self.postprocessors.update(upper_keys(postprocessors or {}))
+        self.preprocessors.update(upper_keys(preprocessors or {}))
+
+        # HACK: We would like to use the :attr:`API.decorators` class attribute
+        # in order to decorate each view method with a decorator that catches
+        # database integrity errors. However, in order to rollback the session,
+        # we need to have a session object available to roll back. Therefore we
+        # need to manually decorate each of the view functions here.
+        decorate = lambda name, f: setattr(self, name, f(getattr(self, name)))
+        for method in ['get', 'post', 'patch', 'put', 'delete']:
+            # Check if the subclass has the method before trying to decorate
+            # it.
+            if hasattr(self, method):
+                decorate(method, catch_integrity_errors(self.session))
+
+    def _handle_validation_exception(self, exception):
+        """Rolls back the session, extracts validation error messages, and
+        returns a :func:`flask.jsonify` response with :http:statuscode:`400`
+        containing the extracted validation error messages.
+
+        Again, *this method calls
+        :meth:`sqlalchemy.orm.session.Session.rollback`*.
+
+        """
+        self.session.rollback()
+        errors = extract_error_messages(exception) or \
+            'Could not determine specific validation errors'
+        return errors_response(400, errors)
+
+
+class API(APIBase):
     """Provides method-based dispatching for :http:method:`get`,
     :http:method:`post`, :http:method:`patch`, :http:method:`put`, and
     :http:method:`delete` requests, for both collections of models and
@@ -522,15 +691,11 @@ class API(ModelView):
 
     """
 
-    #: List of decorators applied to every method of this class.
-    decorators = ModelView.decorators + [catch_processing_exceptions]
-
     def __init__(self, session, model, exclude_columns=None,
                  include_columns=None, include_methods=None,
-                 validation_exceptions=None, results_per_page=10,
-                 max_results_per_page=100, post_form_preprocessor=None,
-                 preprocessors=None, postprocessors=None, primary_key=None,
-                 serializer=None, deserializer=None, *args, **kw):
+                 results_per_page=10, max_results_per_page=100,
+                 serializer=None, deserializer=None, includes=None,
+                 allow_client_generated_ids=False, *args, **kw):
         """Instantiates this view with the specified attributes.
 
         `session` is the SQLAlchemy session in which all database transactions
@@ -538,6 +703,9 @@ class API(ModelView):
 
         `model` is the SQLAlchemy model class for which this instance of the
         class is an API. This model should live in `database`.
+
+        `collection_name` is a string by which a collection of instances of
+        `model` are presented to the user.
 
         `validation_exceptions` is the tuple of exceptions raised by backend
         validation (if any exist). If exceptions are specified here, any
@@ -673,10 +841,20 @@ class API(ModelView):
             self.include_columns, self.include_relations = _parse_includes(
                 [self._get_column_name(column) for column in include_columns])
         self.include_methods = include_methods
-        self.validation_exceptions = tuple(validation_exceptions or ())
+        # TODO this keyword argument doesn't exist yet
+        #
+        #     self.default_fields = fields
+        #
+        self.default_fields = None
+        if self.default_fields is not None:
+            self.default_fields = frozenset(self.default_fields)
+        self.default_includes = includes
+        if self.default_includes is not None:
+            self.default_includes = frozenset(self.default_includes)
+        self.collection_name = collection_name(self.model)
         self.results_per_page = results_per_page
         self.max_results_per_page = max_results_per_page
-        self.primary_key = primary_key
+        self.allow_client_generated_ids = allow_client_generated_ids
         # Use our default serializer and deserializer if none are specified.
         if serializer is None:
             self.serialize = self._inst_to_dict
@@ -689,36 +867,6 @@ class API(ModelView):
                                                + [ValidationError])
         else:
             self.deserialize = deserializer
-        self.postprocessors = defaultdict(list)
-        self.preprocessors = defaultdict(list)
-        self.postprocessors.update(upper_keys(postprocessors or {}))
-        self.preprocessors.update(upper_keys(preprocessors or {}))
-        # move post_form_preprocessor to preprocessors['POST'] for backward
-        # compatibility
-        if post_form_preprocessor:
-            msg = ('post_form_preprocessor is deprecated and will be removed'
-                   ' in version 1.0; use preprocessors instead.')
-            warnings.warn(msg, DeprecationWarning)
-            self.preprocessors['POST'].append(post_form_preprocessor)
-        # postprocessors for PUT are applied to PATCH because PUT is just a
-        # redirect to PATCH
-        for postprocessor in self.postprocessors['PUT_SINGLE']:
-            self.postprocessors['PATCH_SINGLE'].append(postprocessor)
-        for preprocessor in self.preprocessors['PUT_SINGLE']:
-            self.preprocessors['PATCH_SINGLE'].append(preprocessor)
-        for postprocessor in self.postprocessors['PUT_MANY']:
-            self.postprocessors['PATCH_MANY'].append(postprocessor)
-        for preprocessor in self.preprocessors['PUT_MANY']:
-            self.preprocessors['PATCH_MANY'].append(preprocessor)
-
-        # HACK: We would like to use the :attr:`API.decorators` class attribute
-        # in order to decorate each view method with a decorator that catches
-        # database integrity errors. However, in order to rollback the session,
-        # we need to have a session object available to roll back. Therefore we
-        # need to manually decorate each of the view functions here.
-        decorate = lambda name, f: setattr(self, name, f(getattr(self, name)))
-        for method in ['get', 'post', 'patch', 'put', 'delete']:
-            decorate(method, catch_integrity_errors(self.session))
 
     def _get_column_name(self, column):
         """Retrieve a column name from a column attribute of SQLAlchemy
@@ -904,20 +1052,6 @@ class API(ModelView):
 
         return tochange
 
-    def _handle_validation_exception(self, exception):
-        """Rolls back the session, extracts validation error messages, and
-        returns a :func:`flask.jsonify` response with :http:statuscode:`400`
-        containing the extracted validation error messages.
-
-        Again, *this method calls
-        :meth:`sqlalchemy.orm.session.Session.rollback`*.
-
-        """
-        self.session.rollback()
-        errors = extract_error_messages(exception) or \
-            'Could not determine specific validation errors'
-        return dict(validation_errors=errors), 400
-
     def _compute_results_per_page(self):
         """Helper function which returns the number of results per page based
         on the request argument ``results_per_page`` and the server
@@ -934,7 +1068,7 @@ class API(ModelView):
         return min(results_per_page, self.max_results_per_page)
 
     # TODO it is ugly to have `deep` as an arg here; can we remove it?
-    def _paginated(self, instances, deep):
+    def _paginated(self, instances, type_, deep):
         """Returns a paginated JSONified response from the specified list of
         model instances.
 
@@ -973,20 +1107,25 @@ class API(ModelView):
             start = 0
             end = num_results
             total_pages = 1
-        objects = [to_dict(x, deep, exclude=self.exclude_columns,
+        objects = [to_dict(x, type_=type_, deep=deep,
+                           exclude=self.exclude_columns,
                            exclude_relations=self.exclude_relations,
                            include=self.include_columns,
                            include_relations=self.include_relations,
                            include_methods=self.include_methods)
                    for x in instances[start:end]]
-        return dict(page=page_num, objects=objects, total_pages=total_pages,
-                    num_results=num_results)
+        return dict(meta=dict(page=page_num, total_pages=total_pages,
+                              num_results=num_results),
+                    objects=objects)
 
-    def _inst_to_dict(self, inst):
+    def _inst_to_dict(self, inst, only=None):
         """Returns the dictionary representation of the specified instance.
 
-        This method respects the include and exclude columns specified in the
-        constructor of this class.
+        If `only` is specified, only the attributes whose names are given as
+        strings in this set appear in the returned dictionary.
+
+        If `only` is not specified, this method uses the include and exclude
+        columns specified in the constructor of this class.
 
         """
         # create a placeholder for the relations of the returned models
@@ -998,12 +1137,26 @@ class API(ModelView):
             relations &= (cols | rels)
         elif self.exclude_columns is not None:
             relations -= frozenset(self.exclude_columns)
-        deep = dict((r, {}) for r in relations)
-        return to_dict(inst, deep, exclude=self.exclude_columns,
-                       exclude_relations=self.exclude_relations,
-                       include=self.include_columns,
-                       include_relations=self.include_relations,
-                       include_methods=self.include_methods)
+        # Check if the client requested only a specified subset of columns to
+        # be included.
+        # fields = request.args.get('fields', None)
+        # if fields is not None:
+        #     fields = fields.split(',')
+        # if fields is None and self.include_columns is None:
+        #     includes = None
+        # else:
+        #     includes = fields + (self.include_columns or [])
+        #deep = dict((r, {}) for r in relations)
+        # Always include at least the type and ID, regardless of what the user
+        # requested.
+        if only is not None:
+            if 'type' not in only:
+                only.add('type')
+            if 'id' not in only:
+                only.add('id')
+        result = to_dict(inst, only)
+        #add_self_link(result, get_model(inst), primary_key_value(inst))
+        return result
 
     def _dict_to_inst(self, data):
         """Returns an instance of the model with the specified attributes."""
@@ -1030,7 +1183,6 @@ class API(ModelView):
         # Instantiate the model with the parameters.
         modelargs = dict([(i, data[i]) for i in props])
         instance = self.model(**modelargs)
-
         # Handling relations, a single level is allowed
         for col in set(relations).intersection(paramkeys):
             submodel = get_related_model(self.model, col)
@@ -1053,7 +1205,7 @@ class API(ModelView):
 
         return instance
 
-    def _instid_to_dict(self, instid):
+    def _instid_to_dict(self, instid, only=None):
         """Returns the dictionary representation of the instance specified by
         `instid`.
 
@@ -1064,7 +1216,7 @@ class API(ModelView):
         inst = get_by(self.session, self.model, instid, self.primary_key)
         if inst is None:
             return {_STATUS: 404}, 404
-        return self._inst_to_dict(inst)
+        return self._inst_to_dict(inst, only)
 
     def _search(self):
         """Defines a generic search function for the database model.
@@ -1133,43 +1285,50 @@ class API(ModelView):
         responses, see :ref:`searchformat`.
 
         """
-        # try to get search query from the request query parameters
-        try:
-            search_params = json.loads(request.args.get('q', '{}'))
-        except (TypeError, ValueError, OverflowError) as exception:
-            current_app.logger.exception(str(exception))
-            return dict(message='Unable to decode data'), 400
+        # try:
+        #     # Get any sorting parameters commands.
+        #     sorting = json.loads(request.args.get('filters', '{}'))
+        # except (TypeError, ValueError, OverflowError) as exception:
+        #     current_app.logger.exception(str(exception))
+        #     detail = 'Unable to decode sorting data as JSON'
+        #     return error_response(400, detail=detail)
 
         for preprocessor in self.preprocessors['GET_MANY']:
-            preprocessor(search_params=search_params)
+            preprocessor(sorting=sorting)
 
-        # resolve date-strings as required by the model
-        for param in search_params.get('filters', list()):
-            if 'name' in param and 'val' in param:
-                query_model = self.model
-                query_field = param['name']
-                if '__' in param['name']:
-                    fieldname, relation = param['name'].split('__')
-                    submodel = getattr(self.model, fieldname)
-                    if isinstance(submodel, InstrumentedAttribute):
-                        query_model = submodel.property.mapper.class_
-                        query_field = relation
-                    elif isinstance(submodel, AssociationProxy):
-                        # For the sake of brevity, rename this function.
-                        get_assoc = get_related_association_proxy_model
-                        query_model = get_assoc(submodel)
-                        query_field = relation
-                to_convert = {query_field: param['val']}
-                try:
-                    result = strings_to_dates(query_model, to_convert)
-                except ValueError as exception:
-                    current_app.logger.exception(str(exception))
-                    return dict(message='Unable to construct query'), 400
-                param['val'] = result.get(query_field)
-
-        # perform a filtered search
+        # # resolve date-strings as required by the model
+        # for param in search_params.get('filters', list()):
+        #     if 'name' in param and 'val' in param:
+        #         query_model = self.model
+        #         query_field = param['name']
+        #         if '__' in param['name']:
+        #             fieldname, relation = param['name'].split('__')
+        #             submodel = getattr(self.model, fieldname)
+        #             if isinstance(submodel, InstrumentedAttribute):
+        #                 query_model = submodel.property.mapper.class_
+        #                 query_field = relation
+        #             elif isinstance(submodel, AssociationProxy):
+        #                 # For the sake of brevity, rename this function.
+        #                 get_assoc = get_related_association_proxy_model
+        #                 query_model = get_assoc(submodel)
+        #                 query_field = relation
+        #         to_convert = {query_field: param['val']}
+        #         try:
+        #             result = strings_to_dates(query_model, to_convert)
+        #         except ValueError as exception:
+        #             current_app.logger.exception(str(exception))
+        #             return dict(message='Unable to construct query'), 400
+        #         param['val'] = result.get(query_field)
+        sort = request.args.get('sort')
+        if sort:
+            sort = [(value[0], value[1:]) for value in sort.split(',')]
+        else:
+            sort = []
+        if any(order not in ('+', '-') for order, field in sort):
+            detail = 'Each sort parameter must begin with "+" or "-".'
+            return error_response(400, detail=detail)
         try:
-            result = search(self.session, self.model, search_params)
+            result = search(self.session, self.model, sort)
         except NoResultFound:
             return dict(message='No result found'), 404
         except MultipleResultsFound:
@@ -1178,48 +1337,225 @@ class API(ModelView):
             current_app.logger.exception(str(exception))
             return dict(message='Unable to construct query'), 400
 
-        # create a placeholder for the relations of the returned models
-        relations = frozenset(get_relations(self.model))
-        # do not follow relations that will not be included in the response
-        if self.include_columns is not None:
-            cols = frozenset(self.include_columns)
-            rels = frozenset(self.include_relations)
-            relations &= (cols | rels)
-        elif self.exclude_columns is not None:
-            relations -= frozenset(self.exclude_columns)
-        deep = dict((r, {}) for r in relations)
+        # # create a placeholder for the relations of the returned models
+        # relations = frozenset(get_relations(self.model))
+        # # do not follow relations that will not be included in the response
+        # if self.include_columns is not None:
+        #     cols = frozenset(self.include_columns)
+        #     rels = frozenset(self.include_relations)
+        #     relations &= (cols | rels)
+        # elif self.exclude_columns is not None:
+        #     relations -= frozenset(self.exclude_columns)
+        # deep = dict((r, {}) for r in relations)
 
+        # Get the fields to include for each type of object.
+        fields = parse_sparse_fields()
+        if self.collection_name in fields and self.default_fields is not None:
+            fields[self.collection_name] |= self.default_fields
+        fields = fields.get(self.collection_name)
         # for security purposes, don't transmit list as top-level JSON
         if isinstance(result, Query):
-            result = self._paginated(result, deep)
-            # Create the Link header.
+            # TODO disabling pagination for now to ease transition to JSON API
+            # compliance.
             #
-            # TODO We are already calling self._compute_results_per_page() once
-            # in _paginated(); don't compute it again here.
-            page, last_page = result['page'], result['total_pages']
-            linkstring = create_link_string(page, last_page,
-                                            self._compute_results_per_page())
-            headers = dict(Link=linkstring)
+            # result = self._paginated(result, deep)
+            #
+            # # Create the Link header.
+            # #
+            # # TODO We are already calling self._compute_results_per_page() once
+            # # in _paginated(); don't compute it again here.
+            # page = result['meta']['page']
+            # last_page = result['meta']['total_pages']
+            # linkstring = create_link_string(page, last_page,
+            #                                 self._compute_results_per_page())
+            # headers = dict(Link=linkstring)
+            result = [self.serialize(instance, only=fields)
+                      for instance in result]
+            headers = dict()
         else:
             primary_key = self.primary_key or primary_key_name(result)
-            result = to_dict(result, deep, exclude=self.exclude_columns,
-                             exclude_relations=self.exclude_relations,
-                             include=self.include_columns,
-                             include_relations=self.include_relations,
-                             include_methods=self.include_methods)
+            result = self.serialize(result, only=fields)
             # The URL at which a client can access the instance matching this
             # search query.
             url = '{0}/{1}'.format(request.base_url, result[primary_key])
             headers = dict(Location=url)
 
+        # Wrap the resulting object or list of objects under a `data` key.
+        result = dict(data=result)
+
         for postprocessor in self.postprocessors['GET_MANY']:
             postprocessor(result=result, search_params=search_params)
+
+        # Provide top-level links.
+        result['links'] = dict(self=url_for(self.model))
+        # for relation in get_relations(self.model):
+        #     linkname = '{0}.{1}'.format(self.collection_name, relation)
+        #     related_model = get_related_model(self.model, relation)
+        #     try:
+        #         links[linkname] = url_for(related_model)
+        #     except:
+        #         # TODO Undocumented behavior here: if no API has been created
+        #         # for the model, then simply don't provide a link for it.
+        #         pass
+        # if links:
+        #     result['links'] = links
 
         # HACK Provide the headers directly in the result dictionary, so that
         # the :func:`jsonpify` function has access to them. See the note there
         # for more information.
-        result[_HEADERS] = headers
+        result['meta'] = {_HEADERS: headers}
         return result, 200, headers
+
+    def _get_single(self, instid, relationname=None, relationinstid=None):
+        for preprocessor in self.preprocessors['GET_SINGLE']:
+            temp_result = preprocessor(instance_id=instid)
+            # Let the return value of the preprocessor be the new value of
+            # instid, thereby allowing the preprocessor to effectively specify
+            # which instance of the model to process on.
+            #
+            # We assume that if the preprocessor returns None, it really just
+            # didn't return anything, which means we shouldn't overwrite the
+            # instid.
+            if temp_result is not None:
+                instid = temp_result
+        # get the instance of the "main" model whose ID is instid
+        instance = get_by(self.session, self.model, instid, self.primary_key)
+        if instance is None:
+            message = 'No instance with ID {0}'.format(instid)
+            return error_response(404, detail=message)
+        # Get the fields to include for each type of object.
+        fields = parse_sparse_fields()
+        if self.collection_name in fields and self.default_fields is not None:
+            fields[self.collection_name] |= self.default_fields
+        # If no relation is requested, just return the instance. Otherwise,
+        # get the value of the relation specified by `relationname`.
+        if relationname is None:
+            # Determine the fields to include for this object.
+            fields_for_this = fields.get(self.collection_name)
+            result = self.serialize(instance, only=fields_for_this)
+        else:
+            related_value = getattr(instance, relationname)
+            # create a placeholder for the relations of the returned models
+            related_model = get_related_model(self.model, relationname)
+            relations = frozenset(get_relations(related_model))
+            # Determine fields to include for this model.
+            fields_for_this = fields.get(collection_name(related_model))
+            if relationinstid is not None:
+                related_value_instance = get_by(self.session, related_model,
+                                                relationinstid)
+                if related_value_instance is None:
+                    return {_STATUS: 404}, 404
+                result = self.serialize(related_value_instance,
+                                        fields_for_this)
+            else:
+                # for security purposes, don't transmit list as top-level JSON
+                if is_like_list(instance, relationname):
+                    # TODO Disabled pagination for now in order to ease
+                    # transition into JSON API compliance.
+                    #
+                    #     result = self._paginated(list(related_value), deep)
+                    #
+                    result = [self.serialize(instance, only=fields_for_this)
+                              for instance in related_value]
+                else:
+                    result = self.serialize(related_value, fields_for_this)
+        if result is None:
+            return {_STATUS: 404}, 404
+        # Wrap the result
+        result = dict(data=result)
+        # Add any links requested to be included by URL parameters.
+        ids_to_link = self.links_to_add(result)
+        for link, linkids in ids_to_link.items():
+            related_model = model_for(link)
+            related_instances = list(get_by(self.session, related_model,
+                                        link_id) for link_id in linkids)
+            # Determine which fields to include in the linked objects.
+            fields_for_this = fields.get(link)
+            result['linked'].extend(self.serialize(x, only=fields_for_this)
+                                    for x in related_instances)
+        for postprocessor in self.postprocessors['GET_SINGLE']:
+            postprocessor(result=result)
+        return result, 200
+
+    def links_to_add(self, result):
+        # Store the original data in a variable for easier access.
+        original = result['data']
+        if isinstance(original, list):
+            has_links = any('links' in resource for resource in original)
+        else:
+            has_links = 'links' in original
+        if not has_links:
+            return {}
+        # Add any links requested to be included by URL parameters.
+        #
+        # We expect `toinclude` to be a comma-separated list of relationship
+        # paths.
+        toinclude = request.args.get('include')
+        if toinclude is None and self.default_includes is None:
+            return {}
+        elif toinclude is None and self.default_includes is not None:
+            toinclude = self.default_includes
+        elif toinclude is not None and self.default_includes is None:
+            toinclude = set(toinclude.split(','))
+        else:  # toinclude is not None and self.default_includes is not None:
+            toinclude = set(toinclude.split(',')) | self.default_includes
+        ids_to_link = defaultdict(set)
+        result['linked'] = []
+        # TODO we should reverse the nested-ness of these for loops:
+        # toinclude is likely to be a small list, and `original` could be a
+        # very large list, so the latter should be the outer loop.
+        for link in toinclude:
+            # TODO deal with dot-separated lists.
+            #
+            # If there is a list of instances, collect all the linked IDs
+            # of the appropriate type.
+            if isinstance(original, list):
+                for resource in original:
+                    # If the resource has a link with the name specified in
+                    # `toinclude`, then get the type and IDs of that link.
+                    if link in resource['links']:
+                        link_object = resource['links'][link]
+                        link_type = link_object['type']
+                        if 'ids' in link_object:
+                            ids_to_link[link_type] |= \
+                                set(link_object['ids'])
+                        elif 'id' in resource[link]:
+                            ids_to_link[link_type].add(link_object['id'])
+                        else:
+                            # TODO Raise an error here.
+                            pass
+            # Otherwise, if there is just a single instance, look through
+            # the links to get the IDs of the linked instances.
+            else:
+                # If the resource has a link with the name specified in
+                # `toinclude`, then get the type and IDs of that link.
+                if link in original['links']:
+                    link_object = original['links'][link]
+                    link_type = link_object['type']
+                    if 'ids' in link_object:
+                        ids_to_link[link_type] |= set(link_object['ids'])
+                    elif 'id' in link_object:
+                        ids_to_link[link_type].add(link_object['id'])
+                    else:
+                        # TODO Raise an error here.
+                        pass
+        return ids_to_link
+
+    def _get_many(self, *ids):
+        # Each call to _get_single returns a two-tuple whose left element is
+        # the dictionary to be converted into JSON and whose right element is
+        # the status code.
+        result = [self._get_single(instid) for instid in ids]
+        # If any of the instances was not found, return a 404 for the whole
+        # request.
+        if any(status == 404 for data, status in result):
+            return {_STATUS: 404}, 404
+        # HACK This should really not be necessary.
+        #
+        # Collect all the instances into a single list and wrap the collection
+        # with the collection name.
+        collection = [data[self.collection_name] for data, status in result]
+        return {self.collection_name: collection}, 200
 
     def get(self, instid, relationname, relationinstid):
         """Returns a JSON representation of an instance of model with the
@@ -1237,48 +1573,15 @@ class API(ModelView):
         """
         if instid is None:
             return self._search()
-        for preprocessor in self.preprocessors['GET_SINGLE']:
-            temp_result = preprocessor(instance_id=instid)
-            # Let the return value of the preprocessor be the new value of
-            # instid, thereby allowing the preprocessor to effectively specify
-            # which instance of the model to process on.
-            #
-            # We assume that if the preprocessor returns None, it really just
-            # didn't return anything, which means we shouldn't overwrite the
-            # instid.
-            if temp_result is not None:
-                instid = temp_result
-        # get the instance of the "main" model whose ID is instid
-        instance = get_by(self.session, self.model, instid, self.primary_key)
-        if instance is None:
-            return {_STATUS: 404}, 404
-        # If no relation is requested, just return the instance. Otherwise,
-        # get the value of the relation specified by `relationname`.
-        if relationname is None:
-            result = self.serialize(instance)
-        else:
-            related_value = getattr(instance, relationname)
-            # create a placeholder for the relations of the returned models
-            related_model = get_related_model(self.model, relationname)
-            relations = frozenset(get_relations(related_model))
-            deep = dict((r, {}) for r in relations)
-            if relationinstid is not None:
-                related_value_instance = get_by(self.session, related_model,
-                                                relationinstid)
-                if related_value_instance is None:
-                    return {_STATUS: 404}, 404
-                result = to_dict(related_value_instance, deep)
-            else:
-                # for security purposes, don't transmit list as top-level JSON
-                if is_like_list(instance, relationname):
-                    result = self._paginated(list(related_value), deep)
-                else:
-                    result = to_dict(related_value, deep)
-        if result is None:
-            return {_STATUS: 404}, 404
-        for postprocessor in self.postprocessors['GET_SINGLE']:
-            postprocessor(result=result)
-        return result
+        # HACK-ish: If we don't do this, Flask gets confused and routes GET
+        # requests of the form `/api/computers/1/links/owner` here. This is
+        # because the RelationshipAPI class doesn't allow GET methods.
+        if relationname == 'links':
+            detail = ('This server does not allow GET requests to relationship'
+                      ' URLs; maybe you meant to send a request to the related'
+                      ' resource URL instead?')
+            return error_response(403, detail=detail)
+        return self._get_single(instid, relationname, relationinstid)
 
     def _delete_many(self):
         """Deletes multiple instances of the model.
@@ -1371,30 +1674,92 @@ class API(ModelView):
             # See the note under the preprocessor in the get() method.
             if temp_result is not None:
                 instid = temp_result
-        inst = get_by(self.session, self.model, instid, self.primary_key)
-        if relationname:
-            # If the request is ``DELETE /api/person/1/computers``, error 400.
-            if not relationinstid:
-                msg = ('Cannot DELETE entire "{0}"'
-                       ' relation').format(relationname)
-                return dict(message=msg), 400
-            # Otherwise, get the related instance to delete.
-            relation = getattr(inst, relationname)
-            related_model = get_related_model(self.model, relationname)
-            relation_instance = get_by(self.session, related_model,
-                                       relationinstid)
-            # Removes an object from the relation list.
-            relation.remove(relation_instance)
+        if ',' in instid:
+            ids = instid.split(',')
+            inst = [get_by(self.session, self.model, id_, self.primary_key)
+                    for id_ in ids]
+        else:
+            inst = get_by(self.session, self.model, instid, self.primary_key)
+        if relationname is not None:
+            # If no such relation exists, return an error to the client.
+            if not hasattr(inst, relationname):
+                msg = 'No such link: {0}'.format(relationname)
+                return dict(message=msg), 404
+            # If this is a delete of a one-to-many relationship, remove the
+            # related instance.
+            if relationinstid is not None:
+                related_model = get_related_model(self.model, relationname)
+                relation = getattr(inst, relationname)
+                if ',' in relationinstid:
+                    ids = relationinstid.split(',')
+                else:
+                    ids = [relationinstid]
+                toremove = (get_by(self.session, related_model, id_) for id_ in
+                            ids)
+                for obj in toremove:
+                    relation.remove(obj)
+            else:
+                # If there is no link there to delete, return an error.
+                if getattr(inst, relationname) is None:
+                    msg = 'No linked instance to delete: {0}'.format(relationname)
+                    return dict(message=msg), 400
+                # TODO this doesn't apply to a many-to-one endpoint applies
+                #
+                # if not relationinstid:
+                #     msg = ('Cannot DELETE entire "{0}"'
+                #            ' relation').format(relationname)
+                #     return dict(message=msg), 400
+                #
+                # Otherwise, remove the related instance.
+                setattr(inst, relationname, None)
             was_deleted = len(self.session.dirty) > 0
         elif inst is not None:
-            self.session.delete(inst)
+            if not isinstance(inst, list):
+                inst = [inst]
+            for instance in inst:
+                self.session.delete(instance)
             was_deleted = len(self.session.deleted) > 0
         self.session.commit()
         for postprocessor in self.postprocessors['DELETE_SINGLE']:
             postprocessor(was_deleted=was_deleted)
         return {}, 204 if was_deleted else 404
 
-    def post(self):
+    # def _create_single(self, data):
+    #     # Getting the list of relations that will be added later
+    #     cols = get_columns(self.model)
+    #     relations = set(get_relations(self.model))
+    #     # Looking for what we're going to set on the model right now
+    #     colkeys = set(cols.keys())
+    #     fields = set(data.keys())
+    #     props = (colkeys & fields) - relations
+    #     # Instantiate the model with the parameters.
+    #     modelargs = dict([(i, data[i]) for i in props])
+    #     instance = self.model(**modelargs)
+    #     # Handling relations, a single level is allowed
+    #     for col in relations & fields:
+    #         submodel = get_related_model(self.model, col)
+
+    #         if type(data[col]) == list:
+    #             # model has several related objects
+    #             for subparams in data[col]:
+    #                 subinst = get_or_create(self.session, submodel,
+    #                                         subparams)
+    #                 try:
+    #                     getattr(instance, col).append(subinst)
+    #                 except AttributeError:
+    #                     attribute = getattr(instance, col)
+    #                     attribute[subinst.key] = subinst.value
+    #         else:
+    #             # model has single related object
+    #             subinst = get_or_create(self.session, submodel,
+    #                                     data[col])
+    #             setattr(instance, col, subinst)
+
+    #     # add the created model to the session
+    #     self.session.add(instance)
+    #     return instance
+
+    def post(self, instid, relationname, relationinstid):
         """Creates a new instance of a given model based on request data.
 
         This function parses the string contained in
@@ -1415,14 +1780,15 @@ class API(ModelView):
 
         """
         content_type = request.headers.get('Content-Type', None)
-        content_is_json = content_type.startswith('application/json')
+        content_is_json = content_type.startswith(CONTENT_TYPE)
         is_msie = _is_msie8or9()
-        # Request must have the Content-Type: application/json header, unless
-        # the User-Agent string indicates that the client is Microsoft Internet
-        # Explorer 8 or 9 (which has a fixed Content-Type of 'text/html'; see
-        # issue #267).
+        # Request must have the Content-Type: application/vnd.api+json header,
+        # unless the User-Agent string indicates that the client is Microsoft
+        # Internet Explorer 8 or 9 (which has a fixed Content-Type of
+        # 'text/html'; see issue #267).
         if not is_msie and not content_is_json:
-            msg = 'Request must have "Content-Type: application/json" header'
+            msg = ('Request must have "Content-Type: {0}"'
+                   ' header').format(CONTENT_TYPE)
             return dict(message=msg), 415
 
         # try to read the parameters for the model from the body of the request
@@ -1432,6 +1798,10 @@ class API(ModelView):
             if is_msie:
                 data = json.loads(request.get_data()) or {}
             else:
+                # This doesn't work in versions of Flask less than 1.0 because
+                # in those versions, get_json() only works if the request
+                # content type is application/json; we require the content type
+                # specified in :data:`CONTENT_TYPE`.
                 data = request.get_json() or {}
         except (BadRequest, TypeError, ValueError, OverflowError) as exception:
             current_app.logger.exception(str(exception))
@@ -1441,36 +1811,210 @@ class API(ModelView):
         for preprocessor in self.preprocessors['POST']:
             preprocessor(data=data)
 
-        try:
-            # Convert the dictionary representation into an instance of the
-            # model.
-            instance = self.deserialize(data)
-            # Add the created model to the session.
-            self.session.add(instance)
-            self.session.commit()
-            # Get the dictionary representation of the new instance as it
-            # appears in the database.
-            result = self.serialize(instance)
-        except self.validation_exceptions as exception:
-            return self._handle_validation_exception(exception)
-        # Determine the value of the primary key for this instance and
-        # encode URL-encode it (in case it is a Unicode string).
-        pk_name = self.primary_key or primary_key_name(instance)
-        primary_key = result[pk_name]
-        try:
-            primary_key = str(primary_key)
-        except UnicodeEncodeError:
-            primary_key = url_quote_plus(primary_key.encode('utf-8'))
-        # The URL at which a client can access the newly created instance
-        # of the model.
-        url = '{0}/{1}'.format(request.base_url, primary_key)
-        # Provide that URL in the Location header in the response.
-        headers = dict(Location=url)
+        # Check if this is a request to update a relation.
+        if (instid is not None and relationname is not None
+            and relationinstid is None):
+            # Get the instance on which to set the relationship info.
+            instance = get_by(self.session, self.model, instid)
+            # If no such relation exists, return an error to the client.
+            if not hasattr(instance, relationname):
+                msg = 'No such link: {0}'.format(relationname)
+                return dict(message=msg), 404
+            related_model = get_related_model(self.model, relationname)
+            relation = getattr(instance, relationname)
+            # If it is -to-many relation, add to the existing list.
+            if is_like_list(instance, relationname):
+                related_id = data.pop(relationname)
+                if isinstance(related_id, list):
+                    related_instances = [get_by(self.session, related_model,
+                                                d) for d in related_id]
+                else:
+                    related_instances = [get_by(self.session, related_model,
+                                                related_id)]
+                relation.extend(related_instances)
+            # Otherwise it is a -to-one relation.
+            else:
+                # If there is already something there, return an error.
+                if relation is not None:
+                    msg = ('Cannot POST to a -to-one relationship that already'
+                           ' has a linked instance (with ID'
+                           ' {0})').format(relationinstid)
+                    return dict(message=msg), 400
+                # Get the ID of the related model to which to set the link.
+                #
+                # TODO I don't know the collection name for the linked objects,
+                # so I can't provide a correctly named mapping here.
+                #
+                # related_id = data[collection_name(related_model)]
+                related_id = data.popitem()[1]
+                related_instance = get_by(self.session, related_model,
+                                          related_id)
+                try:
+                    setattr(instance, relationname, related_instance)
+                except self.validation_exceptions as exception:
+                    current_app.logger.exception(str(exception))
+                    return self._handle_validation_exception(exception)
+            result = {}
+            status = 204
+            headers = {}
+        else:
+            # Unwrap the data from the collection name key.
+            data = data['data']
+            has_many = isinstance(data, list)
+            try:
+                # Convert the dictionary representation into an instance of the
+                # model.
+                if has_many:
+                    instances = [self.deserialize(obj) for obj in data]
+                    # Add the created model to the session.
+                    self.session.add_all(instances)
+                else:
+                    if 'type' not in data:
+                        detail = 'Must specify correct data type'
+                        return error_response(400, detail=detail)
+                    if 'id' in data and not self.allow_client_generated_ids:
+                        detail = 'Server does not allow client-generated IDS'
+                        return error_response(403, detail=detail)
+                    type_ = data.pop('type')
+                    if type_ != self.collection_name:
+                        message = ('Type must be {0}, not'
+                                   ' {1}').format(self.collection_name, type_)
+                        return error_response(409, detail=message)
+                    instance = self.deserialize(data)
+                    self.session.add(instance)
+                self.session.commit()
+                # Get the dictionary representation of the new instance as it
+                # appears in the database.
+                if has_many:
+                    result = [self.serialize(instance) for instance in instances]
+                else:
+                    result = self.serialize(instance)
+            except self.validation_exceptions as exception:
+                return self._handle_validation_exception(exception)
+            # Determine the value of the primary key for this instance and
+            # encode URL-encode it (in case it is a Unicode string).
+            if has_many:
+                primary_keys = [primary_key_value(instance, as_string=True)
+                                for instance in instances]
+            else:
+                primary_key = primary_key_value(instance, as_string=True)
+            # The URL at which a client can access the newly created instance
+            # of the model.
+            if has_many:
+                urls = ['{0}/{1}'.format(request.base_url, k)
+                        for k in primary_keys]
+            else:
+                url = '{0}/{1}'.format(request.base_url, primary_key)
+            # Provide that URL in the Location header in the response.
+            if has_many:
+                headers = (('Location', url) for url in urls)
+            else:
+                headers = dict(Location=url)
+            # Wrap the resulting object or list of objects under a 'data' key.
+            result = dict(data=result)
+            status = 201
         for postprocessor in self.postprocessors['POST']:
             postprocessor(result=result)
-        return result, 201, headers
+        return result, status, headers
 
-    def patch(self, instid, relationname, relationinstid):
+    def _update_single(self, instance, data):
+        # Update any relationships.
+        links = data.pop('links', {})
+        for linkname, link in links.items():
+            related_model = get_related_model(self.model, linkname)
+            # If the client provided "null" for this relation, remove it by
+            # setting the attribute to ``None``.
+            if link is None:
+                setattr(instance, linkname, None)
+                continue
+            type_ = link['type']
+            # TODO check for conflicting or missing types here
+            #
+            # If this is a to-one relationship, just get the single related
+            # resource. If it is a to-many relationship, get all the related
+            # resources.
+            if 'id' in link:
+                newvalue = get_by(self.session, related_model, link['id'])
+            elif 'ids' in link:
+                # Replacement of a to-many relationship may have been disabled
+                # by the user.
+                if not self.allow_to_many_replacement:
+                    message = 'Not allowed to replace a to-many relationship'
+                    return error_response(403, detail=message)
+                newvalue = [get_by(self.session, related_model, related_id)
+                            for related_id in link['ids']]
+            else:
+                # TODO raise error here for missing id or ids
+                pass
+            # If the to-one relationship resource or any of the to-many
+            # relationship resources do not exist, return an error response.
+            if newvalue is None:
+                detail = ('No object of type {0} found'
+                          ' with ID {1}').format(link['type'], link['id'])
+                return error_response(404, detail=detail)
+            elif isinstance(newvalue, list) and any(value is None
+                                                    for value in newvalue):
+                not_found = (id_ for id_, value in zip(link['ids'], newvalue)
+                             if value is None)
+                msg = 'No object of type {0} found with ID {1}'
+                errors = [error(detail=msg.format(link['type'], id_))
+                          for id_ in not_found]
+                return errors_response(404, errors)
+            try:
+                setattr(instance, linkname, newvalue)
+            except self.validation_exceptions as exception:
+                current_app.logger.exception(str(exception))
+                return self._handle_validation_exception(exception)
+
+        # Check for any request parameter naming a column which does not exist
+        # on the current model.
+        #
+        # Incoming data could be a list or a single resource representation.
+        if isinstance(data, list):
+            fields = set(chain(data))
+        else:
+            fields = data.keys()
+        for field in fields:
+            if not has_field(self.model, field):
+                msg = "Model does not have field '{0}'".format(field)
+                return dict(message=msg), 400
+
+        # if putmany:
+        #     try:
+        #         # create a SQLALchemy Query from the query parameter `q`
+        #         query = create_query(self.session, self.model, search_params)
+        #     except Exception as exception:
+        #         current_app.logger.exception(str(exception))
+        #         return dict(message='Unable to construct query'), 400
+        # else:
+        for link, value in data.pop('links', {}).items():
+            related_model = get_related_model(self.model, link)
+            related_instance = get_by(self.session, related_model, value)
+            try:
+                setattr(instance, link, related_instance)
+            except self.validation_exceptions as exception:
+                current_app.logger.exception(str(exception))
+                return self._handle_validation_exception(exception)
+        #field_list = frozenset(data) ^ relations
+        #data = dict((field, data[field]) for field in field_list)
+
+        # Special case: if there are any dates, convert the string form of the
+        # date into an instance of the Python ``datetime`` object.
+        data = strings_to_dates(self.model, data)
+
+        try:
+            # Let's update all instances present in the query
+            num_modified = 0
+            if data:
+                for field, value in data.items():
+                    setattr(instance, field, value)
+                num_modified += 1
+            self.session.commit()
+        except self.validation_exceptions as exception:
+            current_app.logger.exception(str(exception))
+            return self._handle_validation_exception(exception)
+
+    def put(self, instid, relationname, relationinstid):
         """Updates the instance specified by ``instid`` of the named model, or
         updates multiple instances if ``instid`` is ``None``.
 
@@ -1496,14 +2040,15 @@ class API(ModelView):
 
         """
         content_type = request.headers.get('Content-Type', None)
-        content_is_json = content_type.startswith('application/json')
+        content_is_json = content_type.startswith(CONTENT_TYPE)
         is_msie = _is_msie8or9()
-        # Request must have the Content-Type: application/json header, unless
-        # the User-Agent string indicates that the client is Microsoft Internet
-        # Explorer 8 or 9 (which has a fixed Content-Type of 'text/html'; see
-        # issue #267).
+        # Request must have the Content-Type: application/vnd.api+json header,
+        # unless the User-Agent string indicates that the client is Microsoft
+        # Internet Explorer 8 or 9 (which has a fixed Content-Type of
+        # 'text/html'; see issue #267).
         if not is_msie and not content_is_json:
-            msg = 'Request must have "Content-Type: application/json" header'
+            msg = ('Request must have "Content-Type: {0}"'
+                   ' header').format(CONTENT_TYPE)
             return dict(message=msg), 415
 
         # try to load the fields/values to update from the body of the request
@@ -1518,83 +2063,386 @@ class API(ModelView):
             # this also happens when request.data is empty
             current_app.logger.exception(str(exception))
             return dict(message='Unable to decode data'), 400
-
-        # Check if the request is to patch many instances of the current model.
-        patchmany = instid is None
-        # Perform any necessary preprocessing.
-        if patchmany:
-            # Get the search parameters; all other keys in the `data`
-            # dictionary indicate a change in the model's field.
-            search_params = data.pop('q', {})
-            for preprocessor in self.preprocessors['PATCH_MANY']:
-                preprocessor(search_params=search_params, data=data)
-        else:
-            for preprocessor in self.preprocessors['PATCH_SINGLE']:
-                temp_result = preprocessor(instance_id=instid, data=data)
-                # See the note under the preprocessor in the get() method.
-                if temp_result is not None:
-                    instid = temp_result
-
-        # Check for any request parameter naming a column which does not exist
-        # on the current model.
-        for field in data:
-            if not has_field(self.model, field):
-                msg = "Model does not have field '{0}'".format(field)
-                return dict(message=msg), 400
-
-        if patchmany:
+        # # Check if the request is to patch many instances of the current model.
+        # putmany = instid is None
+        # # Perform any necessary preprocessing.
+        # if putmany:
+        #     # Get the search parameters; all other keys in the `data`
+        #     # dictionary indicate a change in the model's field.
+        #     search_params = data.pop('q', {})
+        #     for preprocessor in self.preprocessors['PUT_MANY']:
+        #         preprocessor(search_params=search_params, data=data)
+        # else:
+        for preprocessor in self.preprocessors['PUT_SINGLE']:
+            temp_result = preprocessor(instance_id=instid, data=data)
+            # See the note under the preprocessor in the get() method.
+            if temp_result is not None:
+                instid = temp_result
+        # Get the instance on which to set the new attributes.
+        # if ',' in instid:
+        #     ids = instid.split(',')
+        #     #instances = [get_by(self.session, self.model, id_) for id_ in ids]
+        # else:
+        #    ids = instid
+        #    #instances = get_by(self.session, self.model, instid)
+        instance = get_by(self.session, self.model, instid, self.primary_key)
+        # If no instance of the model exists with the specified instance ID,
+        # return a 404 response.
+        if instance is None:
+            detail = 'No instance with ID {0} in model {1}'.format(instid,
+                                                                   self.model)
+            return error_response(404, detail=detail)
+        # Check if this is a request to update a relation.
+        if (instid is not None and relationname is not None
+            and relationinstid is None):
+            related_model = get_related_model(self.model, relationname)
+            # Get the ID of the related model to which to set the link.
+            #
+            # TODO I don't know the collection name for the linked objects, so
+            # I can't provide a correctly named mapping here.
+            #
+            # related_id = data[collection_name(related_model)]
+            related_id = data.popitem()[1]
+            if isinstance(related_id, list):
+                related_instance = [get_by(self.session, related_model, d)
+                                    for d in related_id]
+            else:
+                related_instance = get_by(self.session, related_model,
+                                          related_id)
             try:
-                # create a SQLALchemy Query from the query parameter `q`
-                query = create_query(self.session, self.model, search_params)
-            except Exception as exception:
+                setattr(instance, relationname, related_instance)
+            except self.validation_exceptions as exception:
                 current_app.logger.exception(str(exception))
-                return dict(message='Unable to construct query'), 400
+                return self._handle_validation_exception(exception)
+        # This is a request to update an instance of the model.
         else:
-            # create a SQLAlchemy Query which has exactly the specified row
-            query = query_by_primary_key(self.session, self.model, instid,
-                                         self.primary_key)
-            if query.count() == 0:
-                return {_STATUS: 404}, 404
-            assert query.count() == 1, 'Multiple rows with same ID'
-
-        try:
-            relations = self._update_relations(query, data)
-        except self.validation_exceptions as exception:
-            current_app.logger.exception(str(exception))
-            return self._handle_validation_exception(exception)
-        field_list = frozenset(data) ^ relations
-        data = dict((field, data[field]) for field in field_list)
-
-        # Special case: if there are any dates, convert the string form of the
-        # date into an instance of the Python ``datetime`` object.
-        data = strings_to_dates(self.model, data)
-
-        try:
-            # Let's update all instances present in the query
-            num_modified = 0
-            if data:
-                for item in query.all():
-                    for field, value in data.items():
-                        setattr(item, field, value)
-                    num_modified += 1
-            self.session.commit()
-        except self.validation_exceptions as exception:
-            current_app.logger.exception(str(exception))
-            return self._handle_validation_exception(exception)
-
+            # Unwrap the data from the collection name key.
+            data = data.pop('data', {})
+            if 'type' not in data:
+                message = 'Must specify correct data type'
+                return error_response(400, detail=message)
+            if 'id' not in data:
+                message = 'Must specify resource ID'
+                return error_response(400, detail=message)
+            type_ = data.pop('type')
+            id_ = data.pop('id')
+            if type_ != self.collection_name:
+                message = ('Type must be {0}, not'
+                           ' {1}').format(self.collection_name, type_)
+                return error_response(409, detail=message)
+            if id_ != instid:
+                message = 'ID must be {0}, not {1}'.format(instid, id_)
+                return error_response(409, detail=message)
+            # If we are attempting to update multiple objects.
+            # if isinstance(data, list):
+            #     # Check that the IDs specified in the body of the request match
+            #     # the IDs specified in the URL.
+            #     if not all('id' in d and str(d['id']) in ids for d in data):
+            #         msg = 'IDs in body of request must match IDs in URL'
+            #         return dict(message=msg), 400
+            #     for newdata in data:
+            #         instance = get_by(self.session, self.model, newdata['id'],
+            #                           self.primary_key)
+            #         self._update_single(instance, newdata)
+            # else:
+            # instance = get_by(self.session, self.model, instid,
+            #                   self.primary_key)
+            result = self._update_single(instance, data)
+            # If result is not None, that means there was an error updating the
+            # resource.
+            if result is not None:
+                return result
         # Perform any necessary postprocessing.
-        if patchmany:
-            result = dict(num_modified=num_modified)
-            for postprocessor in self.postprocessors['PATCH_MANY']:
-                postprocessor(query=query, result=result,
-                              search_params=search_params)
-        else:
-            result = self._instid_to_dict(instid)
-            for postprocessor in self.postprocessors['PATCH_SINGLE']:
-                postprocessor(result=result)
+        # if putmany:
+        #     for postprocessor in self.postprocessors['PUT_MANY']:
+        #         postprocessor(query=query, num_modified=num_modified,
+        #                       search_params=search_params)
+        #     return {}, 204
+        #result = self._instid_to_dict(instid)
+        for postprocessor in self.postprocessors['PUT_SINGLE']:
+            postprocessor()
+        return {}, 204
 
-        return result
-
-    def put(self, *args, **kw):
+    def patch(self, *args, **kw):
         """Alias for :meth:`patch`."""
-        return self.patch(*args, **kw)
+        return {'message': 'Not implemented'}
+
+
+class RelationshipAPI(APIBase):
+
+    def __init__(self, *args, allow_delete_from_to_many_relationships=False,
+                 **kw):
+        super(RelationshipAPI, self).__init__(*args, **kw)
+        self.allow_delete_from_to_many_relationships = allow_delete_from_to_many_relationships
+
+    def post(self, instid, relationname):
+        # Request must have the Content-Type: application/vnd.api+json header,
+        # unless the User-Agent string indicates that the client is Microsoft
+        # Internet Explorer 8 or 9 (which has a fixed Content-Type of
+        # 'text/html'; see issue #267).
+        content_type = request.headers.get('Content-Type', None)
+        content_is_json = content_type.startswith(CONTENT_TYPE)
+        is_msie = _is_msie8or9()
+        if not is_msie and not content_is_json:
+            detail = ('Request must have "Content-Type: {0}"'
+                      ' header').format(CONTENT_TYPE)
+            return error_response(415, detail=detail)
+
+        # try to load the fields/values to update from the body of the request
+        try:
+            # HACK Requests made from Internet Explorer 8 or 9 don't have the
+            # correct content type, so request.get_json() doesn't work.
+            if is_msie:
+                data = json.loads(request.get_data()) or {}
+            else:
+                data = request.get_json() or {}
+        except (BadRequest, TypeError, ValueError, OverflowError) as exception:
+            # this also happens when request.data is empty
+            current_app.logger.exception(str(exception))
+            return error_response(400, detail='Unable to decode data')
+        for preprocessor in self.preprocessors['POST']:
+            temp_result = preprocessor(instance_id=instid,
+                                       relation_name=relationname, data=data)
+            # See the note under the preprocessor in the get() method.
+            if temp_result is not None:
+                instid, relationname = temp_result
+        instance = get_by(self.session, self.model, instid, self.primary_key)
+        # If no instance of the model exists with the specified instance ID,
+        # return a 404 response.
+        if instance is None:
+            detail = 'No instance with ID {0} in model {1}'.format(instid,
+                                                                   self.model)
+            return error_response(404, detail=detail)
+        # If no such relation exists, return a 404.
+        if not hasattr(instance, relationname):
+            detail = 'Model {0} has no relation named {1}'.format(self.model,
+                                                                  relationname)
+            return error_response(404, detail=detail)
+        related_model = get_related_model(self.model, relationname)
+        related_value = getattr(instance, relationname)
+        # Unwrap the data from the request.
+        data = data.pop('data', {})
+        if 'type' not in data:
+            detail = 'Must specify correct data type'
+            return error_response(400, detail=detail)
+        if 'ids' not in data:
+            detail = 'Must specify resource IDs'
+            return error_response(400, detail=detail)
+        type_ = data.pop('type')
+        # The type name must match the collection name of model of the
+        # relation.
+        if type_ != collection_name(related_model):
+            detail = ('Type must be {0}, not'
+                      ' {1}').format(collection_name(related_model), type_)
+            return error_response(409, detail=detail)
+        ids = data.pop('ids')
+        # Get the new objects to add to the relation.
+        new_values = set(get_by(self.session, related_model, id_)
+                         for id_ in ids)
+        not_found = [id_ for id_, value in zip(ids, new_values)
+                     if value is None]
+        if not_found:
+            msg = 'No object of type {0} found with ID {1}'
+            errors = [error(detail=msg.format(type_, id_))
+                      for id_ in not_found]
+            return errors_response(404, errors)
+        try:
+            for new_value in new_values:
+                # Don't append a new value if it already exists in the to-many
+                # relationship.
+                if new_value not in related_value:
+                    related_value.append(new_value)
+        except self.validation_exceptions as exception:
+            current_app.logger.exception(str(exception))
+            return self._handle_validation_exception(exception)
+        # TODO do we need to commit the session here?
+        #
+        #     self.session.commit()
+        #
+        # Perform any necessary postprocessing.
+        for postprocessor in self.postprocessors['POST']:
+            postprocessor()
+        return {}, 204
+
+    def put(self, instid, relationname):
+        # Request must have the Content-Type: application/vnd.api+json header,
+        # unless the User-Agent string indicates that the client is Microsoft
+        # Internet Explorer 8 or 9 (which has a fixed Content-Type of
+        # 'text/html'; see issue #267).
+        content_type = request.headers.get('Content-Type', None)
+        content_is_json = content_type.startswith(CONTENT_TYPE)
+        is_msie = _is_msie8or9()
+        if not is_msie and not content_is_json:
+            detail = ('Request must have "Content-Type: {0}"'
+                      ' header').format(CONTENT_TYPE)
+            return error_response(415, detail=detail)
+
+        # try to load the fields/values to update from the body of the request
+        try:
+            # HACK Requests made from Internet Explorer 8 or 9 don't have the
+            # correct content type, so request.get_json() doesn't work.
+            if is_msie:
+                data = json.loads(request.get_data()) or {}
+            else:
+                data = request.get_json() or {}
+        except (BadRequest, TypeError, ValueError, OverflowError) as exception:
+            # this also happens when request.data is empty
+            current_app.logger.exception(str(exception))
+            return error_response(400, detail='Unable to decode data')
+        for preprocessor in self.preprocessors['PUT_SINGLE']:
+            temp_result = preprocessor(instance_id=instid,
+                                       relation_name=relationname, data=data)
+            # See the note under the preprocessor in the get() method.
+            if temp_result is not None:
+                instid, relationname = temp_result
+        instance = get_by(self.session, self.model, instid, self.primary_key)
+        # If no instance of the model exists with the specified instance ID,
+        # return a 404 response.
+        if instance is None:
+            detail = 'No instance with ID {0} in model {1}'.format(instid,
+                                                                   self.model)
+            return error_response(404, detail=detail)
+        # If no such relation exists, return a 404.
+        if not hasattr(instance, relationname):
+            detail = 'Model {0} has no relation named {1}'.format(self.model,
+                                                                  relationname)
+            return error_response(404, detail=detail)
+        related_model = get_related_model(self.model, relationname)
+        related_value = getattr(instance, relationname)
+        # Unwrap the data from the request.
+        data = data.pop('data', {})
+        # If the client sent a null value, we assume it wants to remove a
+        # to-one relationship.
+        if data is None:
+            # TODO check that the relationship is a to-one relationship.
+            setattr(instance, relationname, None)
+        else:
+            if 'type' not in data:
+                detail = 'Must specify correct data type'
+                return error_response(400, detail=detail)
+            if 'id' not in data and 'ids' not in data:
+                detail = 'Must specify resource ID or IDs'
+                return error_response(400, detail=detail)
+            type_ = data.pop('type')
+            # The type name must match the collection name of model of the
+            # relation.
+            if type_ != collection_name(related_model):
+                detail = ('Type must be {0}, not'
+                          ' {1}').format(collection_name(related_model), type_)
+                return error_response(409, detail=detail)
+            # If there is just an 'id' key, we assume the client is trying to set a
+            # to-one relationship.
+            if 'id' in data:
+                id_ = data.pop('id')
+                # The new value with which to replace the current related value.
+                replacement = get_by(self.session, related_model, id_)
+            # If there is an 'ids' key, we assume the client is trying to set a
+            # to-many relationship.
+            elif 'ids' in data:
+                # Replacement of a to-many relationship may have been disabled
+                # by the user.
+                if not self.allow_to_many_replacement:
+                    message = 'Not allowed to replace a to-many relationship'
+                    return error_response(403, detail=message)
+                ids = data.pop('ids')
+                # The new value with which to replace the current related value.
+                replacement = [get_by(self.session, related_model, id_)
+                               for id_ in ids]
+            else:
+                # TODO raise an error
+                pass
+            # If the to-one relationship resource or any of the to-many
+            # relationship resources do not exist, return an error response.
+            if replacement is None:
+                detail = ('No object of type {0} found'
+                          ' with ID {1}').format(type_, id_)
+                return error_response(404, detail=detail)
+            elif isinstance(replacement, list) and any(value is None
+                                                       for value in replacement):
+                not_found = (id_ for id_, value in zip(ids, replacement)
+                             if value is None)
+                msg = 'No object of type {0} found with ID {1}'
+                errors = [error(detail=msg.format(type_, id_))
+                          for id_ in not_found]
+                return errors_response(404, errors)
+            try:
+                setattr(instance, relationname, replacement)
+            except self.validation_exceptions as exception:
+                current_app.logger.exception(str(exception))
+                return self._handle_validation_exception(exception)
+        # TODO do we need to commit the session here?
+        #
+        #     self.session.commit()
+        #
+        # Perform any necessary postprocessing.
+        for postprocessor in self.postprocessors['PUT']:
+            postprocessor()
+        return {}, 204
+
+    def delete(self, instid, relationname):
+        # Request must have the Content-Type: application/vnd.api+json header,
+        # unless the User-Agent string indicates that the client is Microsoft
+        # Internet Explorer 8 or 9 (which has a fixed Content-Type of
+        # 'text/html'; see issue #267).
+        content_type = request.headers.get('Content-Type', None)
+        content_is_json = content_type.startswith(CONTENT_TYPE)
+        is_msie = _is_msie8or9()
+        if not is_msie and not content_is_json:
+            detail = ('Request must have "Content-Type: {0}"'
+                      ' header').format(CONTENT_TYPE)
+            return error_response(415, detail=detail)
+
+        if not self.allow_delete_from_to_many_relationships:
+            detail = 'Not allowed to delete from a to-many relationship'
+            return error_response(403, detail=detail)
+
+        # try to load the fields/values to update from the body of the request
+        try:
+            # HACK Requests made from Internet Explorer 8 or 9 don't have the
+            # correct content type, so request.get_json() doesn't work.
+            if is_msie:
+                data = json.loads(request.get_data()) or {}
+            else:
+                data = request.get_json() or {}
+        except (BadRequest, TypeError, ValueError, OverflowError) as exception:
+            # this also happens when request.data is empty
+            current_app.logger.exception(str(exception))
+            return error_response(400, detail='Unable to decode data')
+        was_deleted = False
+        for preprocessor in self.preprocessors['DELETE']:
+            temp_result = preprocessor(instance_id=instid,
+                                       relation_name=relationname)
+            # See the note under the preprocessor in the get() method.
+            if temp_result is not None:
+                instid = temp_result
+        instance = get_by(self.session, self.model, instid, self.primary_key)
+        # If no such relation exists, return an error to the client.
+        if not hasattr(instance, relationname):
+            detail = 'No such link: {0}'.format(relationname)
+            return error_response(404, detail=detail)
+        # We assume that the relation is a to-many relation.
+        related_model = get_related_model(self.model, relationname)
+        relation = getattr(instance, relationname)
+        data = data.pop('data')
+        if 'type' not in data:
+            detail = 'Must specify correct data type'
+            return error_response(400, detail=detail)
+        if 'ids' not in data:
+            detail = 'Must specify resource IDs'
+            return error_response(400, detail=detail)
+        type_ = data['type']
+        ids = data['ids']
+        toremove = set(get_by(self.session, related_model, id_) for id_ in ids)
+        for obj in toremove:
+            try:
+                relation.remove(obj)
+            except ValueError:
+                # The JSON API specification requires that we silently ignore
+                # requests to delete nonexistent objects from a to-many
+                # relation.
+                pass
+        was_deleted = len(self.session.dirty) > 0
+        self.session.commit()
+        for postprocessor in self.postprocessors['DELETE']:
+            postprocessor(was_deleted=was_deleted)
+        return {}, 204 if was_deleted else 404

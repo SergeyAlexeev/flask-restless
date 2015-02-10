@@ -111,26 +111,34 @@ def unregister_fsa_session_signals():
 
 def force_json_contenttype(test_client):
     """Ensures that all requests made by the specified Flask test client have
-    the ``Content-Type`` header set to ``application/json``, unless another
-    content type is explicitly specified.
+    the correct ``Content-Type`` header.
+
+    For :http:method:`patch` requests, this means
+    ``application/json-patch+json``. For all other requests, the content type
+    is set to ``application/vnd.api+json``, unless another content type is
+    explicitly specified at the time the method is invoked.
 
     """
-    for methodname in ('get', 'put', 'patch', 'post', 'delete'):
-        # Create a decorator for the test client request methods that adds
-        # a JSON Content-Type by default if none is specified.
-        def set_content_type(func):
-            def new_func(*args, **kw):
-                if 'content_type' not in kw:
-                    kw['content_type'] = 'application/json'
-                return func(*args, **kw)
-            return new_func
+    # Create a decorator for the test client request methods that adds
+    # a JSON Content-Type by default if none is specified.
+    def set_content_type(func, content_type='application/vnd.api+json'):
+        def new_func(*args, **kw):
+            if 'content_type' not in kw:
+                kw['content_type'] = content_type
+            return func(*args, **kw)
+        return new_func
+
+    for methodname in ('get', 'put', 'post', 'delete'):
         # Decorate the original test client request method.
         old_method = getattr(test_client, methodname)
         setattr(test_client, methodname, set_content_type(old_method))
+    # PATCH methods need to have `application/json-patch+json` content type.
+    test_client.patch = set_content_type(test_client.patch,
+                                         'application/json-patch+json')
 
 
 # This code adapted from
-# http://docs.sqlalchemy.org/en/rel_0_8/core/types.html#backend-agnostic-guid-type
+# http://docs.sqlalchemy.org/en/latest/core/custom_types.html#backend-agnostic-guid-type
 class GUID(TypeDecorator):
     """Platform-independent GUID type.
 
@@ -150,9 +158,10 @@ class GUID(TypeDecorator):
         if dialect.name == 'postgresql':
             return str(value)
         if not isinstance(value, uuid.UUID):
-            return '{0:.32x}'.format(uuid.UUID(value))
-        # hexstring
-        return '{0:.32x}'.format(value)
+            print('value:', value, type(value))
+            return uuid.UUID(value).hex
+        # If we get to this point, we assume `value` is a UUID object.
+        return value.hex
 
     def process_result_value(self, value, dialect):
         if value is None:
@@ -357,7 +366,7 @@ class TestSupport(ManagerTestBase):
 
         class Vehicle(self.Base):
             __tablename__ = 'vehicle'
-            uuid = Column(GUID, primary_key=True)
+            id = Column(GUID, primary_key=True)
 
         class CarModel(self.Base):
             __tablename__ = 'car_model'
