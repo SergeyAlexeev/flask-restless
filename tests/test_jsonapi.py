@@ -271,11 +271,287 @@ class TestDocumentStructure(TestSupport):
         # For example, get computers and projects of a person.
         assert False, 'Not implemented'
 
-    def test_top_level_links(self):
+    def test_top_level_self_link(self):
+        """Tests that there is a top-level links object containing a self link.
+
+        For more information, see the `Top-level Link`_ section of the JSON API
+        specification.
+
+        .. _Top-level links: http://jsonapi.org/format/#document-structure-top-level-links
+
+        """
         response = self.app.get('/api/person')
         document = loads(response.data)
         links = document['links']
         assert links['self'].endswith('/api/person')
+
+    def test_top_level_pagination_link(self):
+        """Tests that there are top-level pagination links by default.
+
+        For more information, see the `Top-level Link`_ section of the JSON API
+        specification.
+
+        .. _Top-level links: http://jsonapi.org/format/#document-structure-top-level-links
+
+        """
+        response = self.app.get('/api/person')
+        document = loads(response.data)
+        links = document['links']
+        assert 'first' in links
+        assert 'last' in links
+        assert 'prev' in links
+        assert 'next' in links
+
+
+class TestPagination(TestSupport):
+
+    def setUp(self):
+        super(TestPagination, self).setUp()
+        self.manager.create_api(self.Person)
+        # HACK Need to create APIs for these other models because otherwise
+        # we're not able to create the link URLs to them.
+        self.manager.create_api(self.Computer)
+        self.manager.create_api(self.Project)
+        #self.manager.create_api(self.ComputerProgram)
+
+    def test_no_client_parameters(self):
+        """Tests that a request without pagination query parameters returns the
+        first page of the collection.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        response = self.app.get('/api/person')
+        document = loads(response.data)
+        pagination = document['links']
+        assert pagination['first'] == 1
+        assert pagination['last'] == 3
+        assert pagination['prev'] == None
+        assert pagination['next'] == 2
+        assert len(document['data']) == 10
+
+    def test_client_page_and_size(self):
+        """Tests that a request that specifies both page number and page size
+        returns the correct page of the collection.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        response = self.app.get('/api/person?page[number]=2&page[size]=3')
+        document = loads(response.data)
+        pagination = document['links']
+        assert pagination['first'] == 1
+        assert pagination['last'] == 9
+        assert pagination['prev'] == 2
+        assert pagination['next'] == 4
+        assert len(document['data']) == 3
+
+    def test_client_number_only(self):
+        """Tests that a request that specifies only the page number returns the
+        correct page with the default page size.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        response = self.app.get('/api/person?page[number]=2')
+        document = loads(response.data)
+        pagination = document['links']
+        assert pagination['first'] == 1
+        assert pagination['last'] == 3
+        assert pagination['prev'] == 1
+        assert pagination['next'] == 3
+        assert len(document['data']) == 10
+
+    def test_client_size_only(self):
+        """Tests that a request that specifies only the page size returns the
+        first page with the requested page size.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        response = self.app.get('/api/person?page[size]=5')
+        document = loads(response.data)
+        pagination = document['links']
+        assert pagination['first'] == 1
+        assert pagination['last'] == 5
+        assert pagination['prev'] == None
+        assert pagination['next'] == 2
+        assert len(document['data']) == 5
+
+    def test_short_page(self):
+        """Tests that a request that specifies the last page may get fewer
+        resources than the page size.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        response = self.app.get('/api/person?page[number]=3')
+        document = loads(response.data)
+        pagination = document['links']
+        assert '/api/person?' in pagination['first']
+        assert 'page[number]=1' in pagination['first']
+        assert '/api/person?' in pagination['last']
+        assert 'page[number]=3' in pagination['last']
+        assert '/api/person?' in pagination['prev']
+        assert 'page[number]=2' in pagination['prev']
+        assert pagination['next'] == None
+        assert len(document['data']) == 5
+
+    def test_server_page_size(self):
+        """Tests for setting the default page size on the server side.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        self.manager.create_api(self.Person, url_prefix='/api2', page_size=5)
+        response = self.app.get('/api2/person?page[number]=3')
+        document = loads(response.data)
+        pagination = document['links']
+        assert pagination['first'] == 1
+        assert pagination['last'] == 5
+        assert pagination['prev'] == 2
+        assert pagination['next'] == 4
+        assert len(document['data']) == 5
+
+    def test_disable_pagination(self):
+        """Tests for disabling default pagination on the server side.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        self.manager.create_api(self.Person, url_prefix='/api2', page_size=0)
+        response = self.app.get('/api2/person')
+        document = loads(response.data)
+        pagination = document['links']
+        assert 'first' not in pagination
+        assert 'last' not in pagination
+        assert 'prev' not in pagination
+        assert 'next' not in pagination
+        assert len(document['data']) == 25
+
+    def test_disable_pagination_ignore_client(self):
+        """Tests that disabling default pagination on the server side ignores
+        client page number requests.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        self.manager.create_api(self.Person, url_prefix='/api2', page_size=0)
+        response = self.app.get('/api2/person&page[number]=2')
+        document = loads(response.data)
+        pagination = document['links']
+        assert 'first' not in pagination
+        assert 'last' not in pagination
+        assert 'prev' not in pagination
+        assert 'next' not in pagination
+        assert len(document['data']) == 25
+        # TODO Should there be an error here?
+
+    def test_max_page_size(self):
+        """Tests that the client cannot exceed the maximum page size.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        self.manager.create_api(self.Person, url_prefix='/api2',
+                                max_page_size=15)
+        response = self.app.get('/api2/person?page[size]=20')
+        document = loads(response.data)
+        assert response.status_code == 400
+        # TODO check the error message here.
+
+    def test_negative_page_size(self):
+        """Tests that the client cannot specify a negative page size.
+
+        For more information, see the `Pagination`_ section of the JSON API
+        specification.
+
+        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
+
+        """
+        response = self.app.get('/api/person?page[size]=-1')
+        document = loads(response.data)
+        assert response.status_code == 400
+        # TODO check the error message here.
+
+    def test_headers(self):
+        """Tests that paginated requests come with ``Link`` headers.
+
+        (This is not part of the JSON API standard, but should live with the
+        other pagination test methods anyway.)
+
+        """
+        people = [self.Person() for i in range(25)]
+        self.session.add_all(people)
+        self.session.commit()
+        response = self.app.get('/api/person?page[number]=4&page[size]=3')
+        links = response.headers.getlist('Link')
+        assert any('/api/person?page[number]=1&page[size]=3>; rel="first"' in l
+                   for l in links)
+        assert any('/api/person?page[number]=9&page[size]=3>; rel="last"' in l
+                   for l in links)
+        assert any('/api/person?page[number]=3&page[size]=3>; rel="prev"' in l
+                   for l in links)
+        assert any('/api/person?page[number]=5&page[size]=3>; rel="next"' in l
+                   for l in links)
+
+
+class TestFiltering(TestSupport):
+    pass
 
 
 class TestFetchingResources(TestSupport):

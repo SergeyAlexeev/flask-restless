@@ -76,8 +76,10 @@ from .helpers import get_related_association_proxy_model
 from .search import search
 
 
+LINKTEMPLATE = '{0}?page[number]={1}&page[size]={2}'
+
 #: Format string for creating Link headers in paginated responses.
-LINKTEMPLATE = '<{0}?page={1}&results_per_page={2}>; rel="{3}"'
+#LINKTEMPLATE = '<{0}?page[number]={1}&page[size]={2}>; rel="{3}"'
 
 #: String used internally as a dictionary key for passing header information
 #: from view functions to the :func:`jsonpify` function.
@@ -693,8 +695,8 @@ class API(APIBase):
 
     def __init__(self, session, model, exclude_columns=None,
                  include_columns=None, include_methods=None,
-                 results_per_page=10, max_results_per_page=100,
-                 serializer=None, deserializer=None, includes=None,
+                 page_size=10, max_page_size=100, serializer=None,
+                 deserializer=None, includes=None,
                  allow_client_generated_ids=False, *args, **kw):
         """Instantiates this view with the specified attributes.
 
@@ -852,8 +854,8 @@ class API(APIBase):
         if self.default_includes is not None:
             self.default_includes = frozenset(self.default_includes)
         self.collection_name = collection_name(self.model)
-        self.results_per_page = results_per_page
-        self.max_results_per_page = max_results_per_page
+        self.page_size = page_size
+        self.max_page_size = max_page_size
         self.allow_client_generated_ids = allow_client_generated_ids
         # Use our default serializer and deserializer if none are specified.
         if serializer is None:
@@ -1052,7 +1054,7 @@ class API(APIBase):
 
         return tochange
 
-    def _compute_results_per_page(self):
+    def _compute_page_size(self):
         """Helper function which returns the number of results per page based
         on the request argument ``results_per_page`` and the server
         configuration parameters :attr:`results_per_page` and
@@ -1060,12 +1062,12 @@ class API(APIBase):
 
         """
         try:
-            results_per_page = int(request.args.get('results_per_page'))
+            page_size = int(request.args.get('page[size]'))
         except:
-            results_per_page = self.results_per_page
-        if results_per_page <= 0:
-            results_per_page = self.results_per_page
-        return min(results_per_page, self.max_results_per_page)
+            page_size = self.page_size
+        if page_size <= 0:
+            page_size = self.page_size
+        return min(page_size, self.max_page_size)
 
     # TODO it is ugly to have `deep` as an arg here; can we remove it?
     def _paginated(self, instances, type_, deep):
@@ -1095,13 +1097,13 @@ class API(APIBase):
             num_results = len(instances)
         else:
             num_results = count(self.session, instances)
-        results_per_page = self._compute_results_per_page()
-        if results_per_page > 0:
+        page_size = self._compute_page_size()
+        if page_size > 0:
             # get the page number (first page is page 1)
-            page_num = int(request.args.get('page', 1))
-            start = (page_num - 1) * results_per_page
-            end = min(num_results, start + results_per_page)
-            total_pages = int(math.ceil(num_results / results_per_page))
+            page_num = int(request.args.get('page[number]', 1))
+            start = (page_num - 1) * page_size
+            end = min(num_results, start + page_size)
+            total_pages = int(math.ceil(num_results / page_size))
         else:
             page_num = 1
             start = 0
@@ -1319,6 +1321,8 @@ class API(APIBase):
         #             current_app.logger.exception(str(exception))
         #             return dict(message='Unable to construct query'), 400
         #         param['val'] = result.get(query_field)
+
+        # Determine sorting options.
         sort = request.args.get('sort')
         if sort:
             sort = [(value[0], value[1:]) for value in sort.split(',')]
@@ -1327,15 +1331,17 @@ class API(APIBase):
         if any(order not in ('+', '-') for order, field in sort):
             detail = 'Each sort parameter must begin with "+" or "-".'
             return error_response(400, detail=detail)
+
+        # Compute the result of the search on the model.
         try:
             result = search(self.session, self.model, sort)
         except NoResultFound:
-            return dict(message='No result found'), 404
+            return error_response(404, detail='No result found')
         except MultipleResultsFound:
-            return dict(message='Multiple results found'), 400
+            return error_response(404, detail='Multiple results found')
         except Exception as exception:
             current_app.logger.exception(str(exception))
-            return dict(message='Unable to construct query'), 400
+            return error_response(400, detail='Unable to construct query')
 
         # # create a placeholder for the relations of the returned models
         # relations = frozenset(get_relations(self.model))
@@ -1348,30 +1354,72 @@ class API(APIBase):
         #     relations -= frozenset(self.exclude_columns)
         # deep = dict((r, {}) for r in relations)
 
-        # Get the fields to include for each type of object.
+        # Determine fields to include for each type of object.
         fields = parse_sparse_fields()
         if self.collection_name in fields and self.default_fields is not None:
             fields[self.collection_name] |= self.default_fields
         fields = fields.get(self.collection_name)
-        # for security purposes, don't transmit list as top-level JSON
+
+        # If the result of the search is a SQLAlchemy query object, we need to
+        # return a collection.
         if isinstance(result, Query):
-            # TODO disabling pagination for now to ease transition to JSON API
-            # compliance.
+            # Determine the client's pagination request: page size and number.
+            page_size = int(request.args.get('page[size]', self.page_size))
+            if page_size < 0:
+                detail = 'Page size must be a positive integer'
+                return error_response(400, detail=detail)
+            if page_size > self.max_page_size:
+                detail = "Page size must not exceed the server's maximum: {0}"
+                detail = detail.format(self.max_page_size)
+                return error_response(400, detail=detail)
+            page_number = int(request.args.get('page[number]', 1))
+            if page_number < 0:
+                detail = 'Page number must be a positive integer'
+                return error_response(400, detail=detail)
+            print(page_size, page_number)
+            # If the query is really a Flask-SQLAlchemy query, we can use the
+            # its built-in pagination.
+            if hasattr(result, 'paginate'):
+                pagination = result.paginate(page_number, page_size,
+                                             error_out=False)
+                first = 1
+                last = pagination.pages
+                prev = pagination.prev_num
+                next_ = pagination.next_num
+                result = [self.serialize(instance, only=fields) for instance in
+                          pagination.items()]
+            else:
+                num_results = count(self.session, result)
+                first = 1
+                last = int(math.ceil(num_results / page_size))
+                prev = page_number - 1 if page_number > 1 else None
+                next_ = page_number + 1 if page_number < last else None
+                offset = (page_number - 1) * page_size
+                result = result.limit(page_size).offset(offset)
+                result = [self.serialize(instance, only=fields)
+                          for instance in result]
+            # Create the pagination link URLs
             #
-            # result = self._paginated(result, deep)
-            #
-            # # Create the Link header.
-            # #
-            # # TODO We are already calling self._compute_results_per_page() once
-            # # in _paginated(); don't compute it again here.
-            # page = result['meta']['page']
-            # last_page = result['meta']['total_pages']
-            # linkstring = create_link_string(page, last_page,
-            #                                 self._compute_results_per_page())
-            # headers = dict(Link=linkstring)
-            result = [self.serialize(instance, only=fields)
-                      for instance in result]
-            headers = dict()
+            # TODO pagination needs to respect sorting, fields, etc., so these
+            # link template strings are not quite right.
+            base_url = request.base_url
+            link_urls = (LINKTEMPLATE.format(base_url, num, page_size)
+                         if num is not None else None
+                         for rel, num in (('first', first), ('last', last),
+                                          ('prev', prev), ('next', next_)))
+            first_url, last_url, prev_url, next_url = link_urls
+            # Make them available for the result dictionary later.
+            pagination_links = dict(first=first_url, last=last_url,
+                                    prev=prev_url, next=next_url)
+            link_strings = ('<{0}>; rel="{1}"'.format(url, rel)
+                            if url is not None else None
+                            for rel, url in (('first', first_url),
+                                             ('last', last_url),
+                                             ('prev', prev_url),
+                                             ('next', next_url)))
+            headers = [('Link', link) for link in link_strings
+                       if link is not None]
+        # Otherwise, the result of the search was a single resource.
         else:
             primary_key = self.primary_key or primary_key_name(result)
             result = self.serialize(result, only=fields)
@@ -1387,7 +1435,12 @@ class API(APIBase):
             postprocessor(result=result, search_params=search_params)
 
         # Provide top-level links.
-        result['links'] = dict(self=url_for(self.model))
+        #
+        # TODO use a defaultdict for result, then cast it to a dict at the end.
+        if 'links' not in result:
+            result['links'] = dict()
+        result['links']['self'] = url_for(self.model)
+        result['links'].update(pagination_links)
         # for relation in get_relations(self.model):
         #     linkname = '{0}.{1}'.format(self.collection_name, relation)
         #     related_model = get_related_model(self.model, relation)

@@ -1183,65 +1183,6 @@ class TestAPI(TestSupport):
         resp = self.app.get('/api/computer/1')
         assert resp.status_code == 404
 
-    def test_pagination(self):
-        """Tests for pagination of long result sets."""
-        self.manager.create_api(self.Person, url_prefix='/api/v2',
-                                results_per_page=5)
-        self.manager.create_api(self.Person, url_prefix='/api/v3',
-                                results_per_page=0)
-        for i in range(25):
-            d = dict(name='person{0}'.format(i))
-            response = self.app.post('/api/person', data=dumps(d))
-            assert response.status_code == 201
-
-        response = self.app.get('/api/person')
-        assert response.status_code == 200
-        data = loads(response.data)
-        assert data['meta']['page'] == 1
-        assert len(data['objects']) == 10
-        assert data['meta']['total_pages'] == 3
-
-        response = self.app.get('/api/person?page=1')
-        assert response.status_code == 200
-        data = loads(response.data)
-        assert data['meta']['page'] == 1
-        assert len(data['objects']) == 10
-        assert data['meta']['total_pages'] == 3
-
-        response = self.app.get('/api/person?page=2')
-        assert response.status_code == 200
-        data = loads(response.data)
-        assert data['meta']['page'] == 2
-        assert len(data['objects']) == 10
-        assert data['meta']['total_pages'] == 3
-
-        response = self.app.get('/api/person?page=3')
-        assert response.status_code == 200
-        data = loads(response.data)
-        assert data['meta']['page'] == 3
-        assert len(data['objects']) == 5
-        assert data['meta']['total_pages'] == 3
-
-        response = self.app.get('/api/v2/person?page=3')
-        assert response.status_code == 200
-        data = loads(response.data)
-        assert data['meta']['page'] == 3
-        assert len(data['objects']) == 5
-        assert data['meta']['total_pages'] == 5
-
-        response = self.app.get('/api/v3/person')
-        assert response.status_code == 200
-        data = loads(response.data)
-        assert data['meta']['page'] == 1
-        assert len(data['objects']) == 25
-        assert data['meta']['total_pages'] == 1
-
-        response = self.app.get('/api/v3/person?page=2')
-        data = loads(response.data)
-        assert data['meta']['page'] == 1
-        assert len(data['objects']) == 25
-        assert data['meta']['total_pages'] == 1
-
     def test_num_results(self):
         """Tests that a request for (a subset of) all instances of a model
         includes the total number of results as part of the JSON response.
@@ -1574,22 +1515,6 @@ class TestHeaders(TestSupportPrefilled):
         expected = 'http://localhost/api/person/6'
         actual = response.headers['Location']
         assert expected == actual
-
-    def test_pagination_links(self):
-        """Tests that a :http:method:`get` request that would respond with a
-        paginated list of results returns the appropriate ``Link`` headers.
-
-        """
-        response = self.app.get('/api/person?page=2&results_per_page=1')
-        assert 200 == response.status_code
-        assert 'Link' in response.headers
-        links = response.headers['Link']
-        # next page
-        assert 'page=3' in links
-        assert 'rel="next"' in links
-        # last page
-        assert 'page=5' in links
-        assert 'rel="last"' in links
 
     def test_content_type(self):
         """Tests that the server responds only to requests with a JSON
