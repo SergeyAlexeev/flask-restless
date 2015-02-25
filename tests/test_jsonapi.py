@@ -16,14 +16,21 @@ from urllib.parse import urlparse
 from uuid import uuid1
 
 from flask import json
+from sqlalchemy import Column
+from sqlalchemy import Integer
+from sqlalchemy import Float
+from sqlalchemy import ForeignKey
+from sqlalchemy import Unicode
+from sqlalchemy.orm import relationship
 
-from .helpers import TestSupport
+from .helpers import ManagerTestBase
+from .helpers import GUID
 
 loads = json.loads
 dumps = json.dumps
 
 
-class TestDocumentStructure(TestSupport):
+class TestDocumentStructure(ManagerTestBase):
     """Tests corresponding to the `Document Structure`_ section of the JSON API
     specification.
 
@@ -35,19 +42,31 @@ class TestDocumentStructure(TestSupport):
         """Creates the database, the :class:`~flask.Flask` object, the
         :class:`~flask_restless.manager.APIManager` for that application, and
         creates the ReSTful API endpoints for the :class:`TestSupport.Person`
-        and :class:`TestSupport.Computer` models.
+        and :class:`TestSupport.Article` models.
 
         """
-        # create the database
         super(TestDocumentStructure, self).setUp()
 
-        # setup the URLs for the Person and Computer API
-        self.manager.create_api(self.Person)
-        self.manager.create_api(self.Computer)
-        # HACK Need to create APIs for these other models because otherwise
-        # we're not able to create the link URLs to them.
-        self.manager.create_api(self.Project)
-        self.manager.create_api(self.ComputerProgram)
+        class Article(self.Base):
+            __tablename__ = 'article'
+            id = Column(Integer, primary_key=True)
+            author_id = Column(Integer, ForeignKey('person.id'))
+            author = relationship('Person')
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+            articles = relationship('Article')
+
+        self.Article = Article
+        self.Person = Person
+        self.Base.metadata.create_all()
+        self.manager.create_api(Article)
+        self.manager.create_api(Person)
+
+    def tearDown(self):
+        """Drops all tables from the temporary database."""
+        self.Base.metadata.drop_all()
 
     def test_get_primary_data(self):
         """Tests that the top-level key in a response is ``data``."""
@@ -113,14 +132,14 @@ class TestDocumentStructure(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        computer.owner = person
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        article.author = person
+        self.session.add_all([person, article])
         self.session.commit()
-        response = self.app.get('/api/computer/1')
-        computer = loads(response.data)['data']
-        relationship_url = computer['links']['owner']['self']
-        assert relationship_url.endswith('/api/computer/1/links/owner')
+        response = self.app.get('/api/article/1')
+        article = loads(response.data)['data']
+        relationship_url = article['links']['author']['self']
+        assert relationship_url.endswith('/api/article/1/links/author')
 
     def test_related_resource_url_to_one(self):
         """Tests that the related resource URL in a to-one relationship
@@ -133,15 +152,15 @@ class TestDocumentStructure(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        computer.owner = person
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        article.author = person
+        self.session.add_all([person, article])
         self.session.commit()
         # Get a resource that has links.
-        response = self.app.get('/api/computer/1')
-        computer = loads(response.data)['data']
+        response = self.app.get('/api/article/1')
+        article = loads(response.data)['data']
         # Get the related resource URL.
-        resource_url = computer['links']['owner']['resource']
+        resource_url = article['links']['author']['resource']
         # The Flask test client doesn't need the `netloc` part of the URL.
         path = urlparse(resource_url).path
         # Fetch the resource at the related resource URL.
@@ -164,29 +183,29 @@ class TestDocumentStructure(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        computer.owner = person
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        article.author = person
+        self.session.add_all([person, article])
         self.session.commit()
         # Get a resource that has links.
         response = self.app.get('/api/person/1')
         document = loads(response.data)
         person = document['data']
         # Get the related resource URL.
-        resource_url = person['links']['computers']['resource']
+        resource_url = person['links']['articles']['resource']
         # The Flask test client doesn't need the `netloc` part of the URL.
         path = urlparse(resource_url).path
         # Fetch the resource at the related resource URL.
         response = self.app.get(path)
         document = loads(response.data)
-        actual_computers = document['data']
+        actual_articles = document['data']
         # Compare it with what we expect to get.
         #
-        # TODO To make this test more robust, filter by `computer.owner == 1`.
-        response = self.app.get('/api/computer')
+        # TODO To make this test more robust, filter by `article.author == 1`.
+        response = self.app.get('/api/article')
         document = loads(response.data)
-        expected_computers = document['data']
-        assert actual_computers == expected_computers
+        expected_articles = document['data']
+        assert actual_articles == expected_articles
 
     def test_link_object(self):
         """Tests for relations as resource URLs."""
@@ -196,11 +215,11 @@ class TestDocumentStructure(TestSupport):
         self.session.commit()
         response = self.app.get('/api/person/1')
         person = loads(response.data)['data']
-        computers = person['links']['computers']
+        articles = person['links']['articles']
         # A link object must contain at least one of 'self', 'resource',
         # linkage to a compound document, or 'meta'.
-        assert computers['self'].endswith('/api/person/1/links/computers')
-        assert computers['resource'].endswith('/api/person/1/computers')
+        assert articles['self'].endswith('/api/person/1/links/articles')
+        assert articles['resource'].endswith('/api/person/1/articles')
         # TODO should also include pagination links
 
     def test_compound_document_to_many(self):
@@ -214,27 +233,27 @@ class TestDocumentStructure(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        person.computers = [computer1, computer2]
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        person.articles = [article1, article2]
+        self.session.add_all([person, article1, article2])
         self.session.commit()
         # For a homogeneous to-many relationship, we should have a 'type' and
         # an 'ids' key.
-        response = self.app.get('/api/person/1?include=computers')
+        response = self.app.get('/api/person/1?include=articles')
         document = loads(response.data)
         person = document['data']
-        computers = person['links']['computers']
-        assert computers['type'] == 'computer'
-        assert ['1', '2'] == sorted(computers['ids'])
+        articles = person['links']['articles']
+        assert articles['type'] == 'article'
+        assert ['1', '2'] == sorted(articles['ids'])
         linked = document['linked']
-        # Sort the links on their IDs, then get the two linked computers.
-        linked_computer1, linked_computer2 = sorted(linked,
+        # Sort the links on their IDs, then get the two linked articles.
+        linked_article1, linked_article2 = sorted(linked,
                                                     key=lambda c: c['id'])
-        assert linked_computer1['type'] == 'computer'
-        assert linked_computer1['id'] == '1'
-        assert linked_computer2['type'] == 'computer'
-        assert linked_computer2['id'] == '2'
+        assert linked_article1['type'] == 'article'
+        assert linked_article1['id'] == '1'
+        assert linked_article2['type'] == 'article'
+        assert linked_article2['id'] == '2'
 
     def test_compound_document_to_one(self):
         """Tests for getting linked resources from a to-one relationship in a
@@ -247,17 +266,17 @@ class TestDocumentStructure(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        computer.owner = person
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        article.author = person
+        self.session.add_all([person, article])
         self.session.commit()
         # For a to-one relationship, we should have a 'type' and an 'id' key.
-        response = self.app.get('/api/computer/1?include=owner')
+        response = self.app.get('/api/article/1?include=author')
         document = loads(response.data)
-        computer = document['data']
-        owner = computer['links']['owner']
-        assert owner['type'] == 'person'
-        assert owner['id'] == 1
+        article = document['data']
+        author = article['links']['author']
+        assert author['type'] == 'person'
+        assert author['id'] == 1
         linked = document['linked']
         linked_person = linked[0]
         assert linked_person['type'] == 'person'
@@ -268,7 +287,7 @@ class TestDocumentStructure(TestSupport):
         document.
 
         """
-        # For example, get computers and projects of a person.
+        # For example, get articles and projects of a person.
         assert False, 'Not implemented'
 
     def test_top_level_self_link(self):
@@ -303,16 +322,22 @@ class TestDocumentStructure(TestSupport):
         assert 'next' in links
 
 
-class TestPagination(TestSupport):
+class TestPagination(ManagerTestBase):
 
     def setUp(self):
         super(TestPagination, self).setUp()
-        self.manager.create_api(self.Person)
-        # HACK Need to create APIs for these other models because otherwise
-        # we're not able to create the link URLs to them.
-        self.manager.create_api(self.Computer)
-        self.manager.create_api(self.Project)
-        #self.manager.create_api(self.ComputerProgram)
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+
+        self.Person = Person
+        self.Base.metadata.create_all()
+        self.manager.create_api(Person)
+
+    def tearDown(self):
+        """Drops all tables from the temporary database."""
+        self.Base.metadata.drop_all()
 
     def test_no_client_parameters(self):
         """Tests that a request without pagination query parameters returns the
@@ -568,11 +593,11 @@ class TestPagination(TestSupport):
                    for l in links)
 
 
-class TestFiltering(TestSupport):
+class TestFiltering(ManagerTestBase):
     pass
 
 
-class TestFetchingResources(TestSupport):
+class TestFetchingResources(ManagerTestBase):
     """Tests corresponding to the `Fetching Resources`_ section of the JSON API
     specification.
 
@@ -584,43 +609,72 @@ class TestFetchingResources(TestSupport):
         """Creates the database, the :class:`~flask.Flask` object, the
         :class:`~flask_restless.manager.APIManager` for that application, and
         creates the ReSTful API endpoints for the :class:`TestSupport.Person`
-        and :class:`TestSupport.Computer` models.
+        and :class:`TestSupport.Article` models.
 
         """
-        # create the database
         super(TestFetchingResources, self).setUp()
 
-        # setup the URLs for the Person and Computer API
-        self.manager.create_api(self.Person)
-        self.manager.create_api(self.Computer)
+        class Article(self.Base):
+            __tablename__ = 'article'
+            id = Column(Integer, primary_key=True)
+            title = Column(Unicode)
+            author_id = Column(Integer, ForeignKey('person.id'))
+            author = relationship('Person')
+
+        class Comment(self.Base):
+            __tablename__ = 'comment'
+            id = Column(Integer, primary_key=True)
+            author_id = Column(Integer, ForeignKey('person.id'))
+            author = relationship('Person')
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+            name = Column(Unicode)
+            age = Column(Integer)
+            other = Column(Float)
+            comments = relationship('Comment')
+            articles = relationship('Article')
+
+        self.Article = Article
+        self.Comment = Comment
+        self.Person = Person
+        self.Base.metadata.create_all()
+        self.manager.create_api(Article)
+        self.manager.create_api(Person)
         # HACK Need to create APIs for these other models because otherwise
         # we're not able to create the link URLs to them.
-        self.manager.create_api(self.Project)
-        self.manager.create_api(self.ComputerProgram)
-        self.manager.create_api(self.Proof)
+        #
+        # TODO Fix this by simply not creating links to related models for
+        # which no API has been made.
+        self.manager.create_api(Comment)
+
+    def tearDown(self):
+        """Drops all tables from the temporary database."""
+        self.Base.metadata.drop_all()
 
     def test_to_many(self):
         """Test for fetching resources from a to-many related resource URL."""
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        person.computers = [computer1, computer2]
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        person.articles = [article1, article2]
+        self.session.add_all([person, article1, article2])
         self.session.commit()
-        response = self.app.get('/api/person/1/computers')
+        response = self.app.get('/api/person/1/articles')
         assert response.status_code == 200
         document = loads(response.data)
-        computers = document['data']
-        assert ['1', '2'] == sorted(c['id'] for c in computers)
+        articles = document['data']
+        assert ['1', '2'] == sorted(c['id'] for c in articles)
 
     def test_to_one(self):
         """Test for fetching resources from a to-one related resource URL."""
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        computer.owner = person
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        article.author = person
+        self.session.add_all([person, article])
         self.session.commit()
-        response = self.app.get('/api/computer/1/owner')
+        response = self.app.get('/api/article/1/author')
         document = loads(response.data)
         person = document['data']
         assert person['id'] == '1'
@@ -636,17 +690,17 @@ class TestFetchingResources(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        person.computers = [computer]
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        person.articles = [article]
+        self.session.add_all([person, article])
         self.session.commit()
         # By default, no links will be included at the top level of the
         # document.
         response = self.app.get('/api/person/1')
         document = loads(response.data)
         person = document['data']
-        computerids = person['links']['computers']['ids']
-        assert computerids == ['1']
+        articleids = person['links']['articles']['ids']
+        assert articleids == ['1']
         assert 'linked' not in document
 
     def test_set_default_inclusion(self):
@@ -660,21 +714,21 @@ class TestFetchingResources(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        person.computers = [computer]
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        person.articles = [article]
+        self.session.add_all([person, article])
         self.session.commit()
-        self.manager.create_api(self.Person, includes=['computers'],
+        self.manager.create_api(self.Person, includes=['articles'],
                                 url_prefix='/api2')
-        # In the alternate API, computers are included by default in compound
+        # In the alternate API, articles are included by default in compound
         # documents.
         response = self.app.get('/api2/person/1')
         document = loads(response.data)
         person = document['data']
         linked = document['linked']
-        computerids = person['links']['computers']['ids']
-        assert computerids == ['1']
-        assert linked[0]['type'] == 'computer'
+        articleids = person['links']['articles']['ids']
+        assert articleids == ['1']
+        assert linked[0]['type'] == 'article'
         assert linked[0]['id'] == '1'
 
     def test_include(self):
@@ -688,20 +742,20 @@ class TestFetchingResources(TestSupport):
 
         """
         person = self.Person(id=1, name='foo')
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        project = self.Project()
-        person.computers = [computer1, computer2]
-        person.projects = [project]
-        self.session.add_all([person, project, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        comment = self.Comment()
+        person.articles = [article1, article2]
+        person.comments = [comment]
+        self.session.add_all([person, comment, article1, article2])
         self.session.commit()
-        response = self.app.get('/api/person/1?include=computers')
+        response = self.app.get('/api/person/1?include=articles')
         assert response.status_code == 200
         document = loads(response.data)
         linked = document['linked']
         # If a client supplied an include request parameter, no other types of
         # objects should be included.
-        assert all(c['type'] == 'computer' for c in linked)
+        assert all(c['type'] == 'article' for c in linked)
         assert ['1', '2'] == sorted(c['id'] for c in linked)
 
     def test_include_multiple(self):
@@ -715,23 +769,23 @@ class TestFetchingResources(TestSupport):
 
         """
         person = self.Person(id=1, name='foo')
-        computer = self.Computer(id=2)
-        project = self.Project(id=3)
-        person.computers = [computer]
-        person.projects = [project]
-        self.session.add_all([person, project, computer])
+        article = self.Article(id=2)
+        comment = self.Comment(id=3)
+        person.articles = [article]
+        person.comments = [comment]
+        self.session.add_all([person, comment, article])
         self.session.commit()
-        response = self.app.get('/api/person/1?include=computers,projects')
+        response = self.app.get('/api/person/1?include=articles,comments')
         assert response.status_code == 200
         document = loads(response.data)
-        # Sort the linked objects by type; 'computer' comes before 'project'
+        # Sort the linked objects by type; 'article' comes before 'comment'
         # lexicographically.
         linked = sorted(document['linked'], key=lambda x: x['type'])
-        linked_computer, linked_project = linked
-        assert linked_computer['type'] == 'computer'
-        assert linked_computer['id'] == '2'
-        assert linked_project['type'] == 'project'
-        assert linked_project['id'] == '3'
+        linked_article, linked_comment = linked
+        assert linked_article['type'] == 'article'
+        assert linked_article['id'] == '2'
+        assert linked_comment['type'] == 'comment'
+        assert linked_comment['id'] == '3'
 
     def test_include_dot_separated(self):
         """Tests that the client can specify resources linked to other
@@ -813,24 +867,24 @@ class TestFetchingResources(TestSupport):
         .. _Sparse Fieldsets: http://jsonapi.org/format/#fetching-sparse-fieldsets
 
         """
-        computer = self.Computer(id=1, name='bar')
-        person = self.Person(id=1, name='foo', age=99, computers=[computer])
-        self.session.add_all([person, computer])
+        article = self.Article(id=1, title='bar')
+        person = self.Person(id=1, name='foo', age=99, articles=[article])
+        self.session.add_all([person, article])
         self.session.commit()
-        # Person objects should only have ID and name, while computer objects
+        # Person objects should only have ID and name, while article objects
         # should only have ID.
-        url = ('/api/person/1?include=computers'
-               '&fields[person]=id,name,computers&fields[computer]=id')
+        url = ('/api/person/1?include=articles'
+               '&fields[person]=id,name,articles&fields[article]=id')
         response = self.app.get(url)
         document = loads(response.data)
         person = document['data']
         linked = document['linked']
-        # We requested 'id', 'name', and 'computers'; 'id' and 'type' must
-        # always be present, and 'computers' comes under a 'links' key.
+        # We requested 'id', 'name', and 'articles'; 'id' and 'type' must
+        # always be present, and 'articles' comes under a 'links' key.
         assert ['id', 'links', 'name', 'type'] == sorted(person)
-        assert ['computers'] == sorted(person['links'])
+        assert ['articles'] == sorted(person['links'])
         # We requested only 'id', but 'type' must always appear as well.
-        assert all(['id', 'type'] == sorted(computer) for computer in linked)
+        assert all(['id', 'type'] == sorted(article) for article in linked)
 
     def test_sort_increasing(self):
         """Tests that the client can specify the fields on which to sort the
@@ -913,17 +967,17 @@ class TestFetchingResources(TestSupport):
         person1 = self.Person(age=20)
         person2 = self.Person(age=10)
         person3 = self.Person(age=30)
-        computer1 = self.Computer(id=1, owner=person1)
-        computer2 = self.Computer(id=2, owner=person2)
-        computer3 = self.Computer(id=3, owner=person3)
-        self.session.add_all([person1, person2, person3, computer1, computer2,
-                              computer3])
+        article1 = self.Article(id=1, author=person1)
+        article2 = self.Article(id=2, author=person2)
+        article3 = self.Article(id=3, author=person3)
+        self.session.add_all([person1, person2, person3, article1, article2,
+                              article3])
         self.session.commit()
         # The plus sign must be URL-encoded as ``%2B``.
-        response = self.app.get('/api/computer?sort=%2Bowner.age')
+        response = self.app.get('/api/article?sort=%2Bauthor.age')
         document = loads(response.data)
-        computers = document['data']
-        assert ['2', '1', '3'] == [c['id'] for c in computers]
+        articles = document['data']
+        assert ['2', '1', '3'] == [c['id'] for c in articles]
 
     def test_filtering(self):
         """Tests that the client can specify filters.
@@ -937,7 +991,7 @@ class TestFetchingResources(TestSupport):
         assert False, 'Not implemented'
 
 
-class TestCreatingResources(TestSupport):
+class TestCreatingResources(ManagerTestBase):
     """Tests corresponding to the `Creating Resources`_ section of the JSON API
     specification.
 
@@ -949,20 +1003,30 @@ class TestCreatingResources(TestSupport):
         """Creates the database, the :class:`~flask.Flask` object, the
         :class:`~flask_restless.manager.APIManager` for that application, and
         creates the ReSTful API endpoints for the :class:`TestSupport.Person`
-        and :class:`TestSupport.Vehicle` models.
+        and :class:`TestSupport.Article` models.
 
         """
-        # create the database
         super(TestCreatingResources, self).setUp()
 
-        # setup the URLs for the Person and Vehicle API
-        self.manager.create_api(self.Person, methods=['POST'])
-        self.manager.create_api(self.Vehicle, methods=['POST'],
+        class Article(self.Base):
+            __tablename__ = 'article'
+            id = Column(GUID, primary_key=True)
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+            name = Column(Unicode)
+
+        self.Article = Article
+        self.Person = Person
+        self.Base.metadata.create_all()
+        self.manager.create_api(Person, methods=['POST'])
+        self.manager.create_api(Article, methods=['POST'],
                                 allow_client_generated_ids=True)
-        # HACK Need to create APIs for these other models because otherwise
-        # we're not able to create the link URLs to them.
-        self.manager.create_api(self.Computer)
-        self.manager.create_api(self.Project)
+
+    def tearDown(self):
+        """Drops all tables from the temporary database."""
+        self.Base.metadata.drop_all()
 
     def test_create(self):
         """Tests that the client can create a single resource.
@@ -1016,17 +1080,17 @@ class TestCreatingResources(TestSupport):
 
         """
         generated_id = uuid1()
-        data = dict(data=dict(type='vehicle', id=generated_id))
-        response = self.app.post('/api/vehicle', data=dumps(data))
+        data = dict(data=dict(type='article', id=generated_id))
+        response = self.app.post('/api/article', data=dumps(data))
         # Our server always responds with 201 when a client-generated ID is
         # specified. It does not return a 204.
         #
         # TODO should we reverse that and only return 204?
         assert response.status_code == 201
         document = loads(response.data)
-        vehicle = document['data']
-        assert vehicle['type'] == 'vehicle'
-        assert vehicle['id'] == str(generated_id)
+        article = document['data']
+        assert article['type'] == 'article'
+        assert article['id'] == str(generated_id)
 
     def test_client_generated_id_forbidden(self):
         """Tests that the client can specify a UUID to become the ID of the
@@ -1038,10 +1102,10 @@ class TestCreatingResources(TestSupport):
         .. _Client-Generated IDs: http://jsonapi.org/format/#crud-creating-client-ids
 
         """
-        self.manager.create_api(self.Vehicle, url_prefix='/api2',
+        self.manager.create_api(self.Article, url_prefix='/api2',
                                 methods=['POST'])
-        data = dict(data=dict(type='vehicle', id=uuid1()))
-        response = self.app.post('/api2/vehicle', data=dumps(data))
+        data = dict(data=dict(type='article', id=uuid1()))
+        response = self.app.post('/api2/article', data=dumps(data))
         assert response.status_code == 403
         # TODO test for error details (for example, a message specifying that
         # client-generated IDs are not allowed).
@@ -1074,16 +1138,16 @@ class TestCreatingResources(TestSupport):
 
         """
         generated_id = uuid1()
-        self.session.add(self.Vehicle(id=generated_id))
+        self.session.add(self.Article(id=generated_id))
         self.session.commit()
-        data = dict(data=dict(type='vehicle', id=generated_id))
-        response = self.app.post('/api/vehicle', data=dumps(data))
+        data = dict(data=dict(type='article', id=generated_id))
+        response = self.app.post('/api/article', data=dumps(data))
         assert response.status_code == 409
         # TODO test for error details (for example, a message specifying that
         # client-generated IDs are not allowed).
 
 
-class TestUpdatingResources(TestSupport):
+class TestUpdatingResources(ManagerTestBase):
     """Tests corresponding to the `Updating Resources`_ section of the JSON API
     specification.
 
@@ -1094,16 +1158,34 @@ class TestUpdatingResources(TestSupport):
     def setUp(self):
         """Creates the database, the :class:`~flask.Flask` object, the
         :class:`~flask_restless.manager.APIManager` for that application, and
-        creates the ReSTful API endpoints for the :class:`TestSupport.Person` and
-        :class:`TestSupport.Computer` models.
+        creates the ReSTful API endpoints for the :class:`TestSupport.Person`
+        and :class:`TestSupport.Article` models.
 
         """
-        # create the database
         super(TestUpdatingResources, self).setUp()
 
-        # setup the URLs for the Person and Computer API
-        self.manager.create_api(self.Person, methods=['PUT'])
-        self.manager.create_api(self.Computer, methods=['PUT'])
+        class Article(self.Base):
+            __tablename__ = 'article'
+            id = Column(Integer, primary_key=True)
+            author_id = Column(Integer, ForeignKey('person.id'))
+            author = relationship('Person')
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+            name = Column(Unicode, unique=True)
+            age = Column(Integer)
+            articles = relationship('Article')
+
+        self.Article = Article
+        self.Person = Person
+        self.Base.metadata.create_all()
+        self.manager.create_api(Person, methods=['PUT'])
+        self.manager.create_api(Article, methods=['PUT'])
+
+    def tearDown(self):
+        """Drops all tables from the temporary database."""
+        self.Base.metadata.drop_all()
 
     def test_update(self):
         """Tests that the client can update a resource's attributes.
@@ -1135,23 +1217,23 @@ class TestUpdatingResources(TestSupport):
         """
         person1 = self.Person(id=1)
         person2 = self.Person(id=2)
-        computer = self.Computer(id=1)
-        person1.computers = [computer]
-        self.session.add_all([person1, person2, computer])
+        article = self.Article(id=1)
+        person1.articles = [article]
+        self.session.add_all([person1, person2, article])
         self.session.commit()
-        # Change the owner of the computer from person 1 to person 2.
+        # Change the author of the article from person 1 to person 2.
         data = {'data':
-                    {'type': 'computer',
+                    {'type': 'article',
                      'id': '1',
                      'links':
-                         {'owner':
+                         {'author':
                               {'type': 'person', 'id': '2'}
                           }
                      }
                 }
-        response = self.app.put('/api/computer/1', data=dumps(data))
+        response = self.app.put('/api/article/1', data=dumps(data))
         assert response.status_code == 204
-        assert computer.owner is person2
+        assert article.author is person2
 
     def test_remove_to_one(self):
         """Tests that the client can remove a resource's to-one relationship.
@@ -1163,21 +1245,21 @@ class TestUpdatingResources(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer()
-        person.computers = [computer]
-        self.session.add_all([person, computer])
+        article = self.Article()
+        person.articles = [article]
+        self.session.add_all([person, article])
         self.session.commit()
-        # Change the owner of the computer to None.
+        # Change the author of the article to None.
         data = {'data':
-                    {'type': 'computer',
+                    {'type': 'article',
                      'id': '1',
                      'links':
-                         {'owner': None}
+                         {'author': None}
                      }
                 }
-        response = self.app.put('/api/computer/1', data=dumps(data))
+        response = self.app.put('/api/article/1', data=dumps(data))
         assert response.status_code == 204
-        assert computer.owner is None
+        assert article.author is None
 
     def test_to_many(self):
         """Tests that the client can update a resource's to-many relationships.
@@ -1189,9 +1271,9 @@ class TestUpdatingResources(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        self.session.add_all([person, article1, article2])
         self.session.commit()
         self.manager.create_api(self.Person, methods=['PUT'],
                                 url_prefix='/api2',
@@ -1200,14 +1282,14 @@ class TestUpdatingResources(TestSupport):
                     {'type': 'person',
                      'id': '1',
                      'links':
-                         {'computers':
-                              {'type': 'computer', 'ids': ['1', '2']}
+                         {'articles':
+                              {'type': 'article', 'ids': ['1', '2']}
                           }
                      }
                 }
         response = self.app.put('/api2/person/1', data=dumps(data))
         assert response.status_code == 204
-        assert set(person.computers) == {computer1, computer2}
+        assert set(person.articles) == {article1, article2}
 
     def test_to_many_clear(self):
         """Tests that the client can clear a resource's to-many relationships.
@@ -1219,10 +1301,10 @@ class TestUpdatingResources(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        person.computers = [computer1, computer2]
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        person.articles = [article1, article2]
+        self.session.add_all([person, article1, article2])
         self.session.commit()
         self.manager.create_api(self.Person, methods=['PUT'],
                                 url_prefix='/api2',
@@ -1231,14 +1313,14 @@ class TestUpdatingResources(TestSupport):
                     {'type': 'person',
                      'id': '1',
                      'links':
-                         {'computers':
-                              {'type': 'computer', 'ids': []}
+                         {'articles':
+                              {'type': 'article', 'ids': []}
                           }
                      }
                 }
         response = self.app.put('/api2/person/1', data=dumps(data))
         assert response.status_code == 204
-        assert person.computers == []
+        assert person.articles == []
 
     def test_to_many_forbidden(self):
         """Tests that the client receives a :http:status:`403` if the server
@@ -1258,8 +1340,8 @@ class TestUpdatingResources(TestSupport):
                     {'type': 'person',
                      'id': '1',
                      'links':
-                         {'computers':
-                              {'type': 'computer', 'ids': []}
+                         {'articles':
+                              {'type': 'article', 'ids': []}
                           }
                      }
                 }
@@ -1313,8 +1395,8 @@ class TestUpdatingResources(TestSupport):
                     {'type': 'person',
                      'id': '1',
                      'links':
-                         {'computers':
-                              {'type': 'computer', 'ids': [1]}
+                         {'articles':
+                              {'type': 'article', 'ids': [1]}
                           }
                      }
                 }
@@ -1379,9 +1461,9 @@ class TestUpdatingResources(TestSupport):
         # TODO test for error details
 
 
-class TestUpdatingRelationships(TestSupport):
-    """Tests corresponding to the `Updating Relationships`_ section of the JSON API
-    specification.
+class TestUpdatingRelationships(ManagerTestBase):
+    """Tests corresponding to the `Updating Relationships`_ section of the JSON
+    API specification.
 
     .. _Updating Relationships: http://jsonapi.org/format/#crud-updating-relationships
 
@@ -1390,16 +1472,32 @@ class TestUpdatingRelationships(TestSupport):
     def setUp(self):
         """Creates the database, the :class:`~flask.Flask` object, the
         :class:`~flask_restless.manager.APIManager` for that application, and
-        creates the ReSTful API endpoints for the :class:`TestSupport.Person` and
-        :class:`TestSupport.Computer` models.
+        creates the ReSTful API endpoints for the :class:`TestSupport.Person`
+        and :class:`TestSupport.Article` models.
 
         """
-        # create the database
         super(TestUpdatingRelationships, self).setUp()
 
-        # setup the URLs for the Person and Computer API
+        class Article(self.Base):
+            __tablename__ = 'article'
+            id = Column(Integer, primary_key=True)
+            author_id = Column(Integer, ForeignKey('person.id'))
+            author = relationship('Person')
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+            articles = relationship('Article')
+
+        self.Article = Article
+        self.Person = Person
+        self.Base.metadata.create_all()
         self.manager.create_api(self.Person, methods=['PUT', 'POST', 'DELETE'])
-        self.manager.create_api(self.Computer, methods=['PUT'])
+        self.manager.create_api(self.Article, methods=['PUT'])
+
+    def tearDown(self):
+        """Drops all tables from the temporary database."""
+        self.Base.metadata.drop_all()
 
     def test_to_one(self):
         """Tests for updating a to-one relationship via a :http:method:`put`
@@ -1413,15 +1511,15 @@ class TestUpdatingRelationships(TestSupport):
         """
         person1 = self.Person(id=1)
         person2 = self.Person(id=2)
-        computer = self.Computer(id=1)
-        computer.owner = person1
-        self.session.add_all([person1, person2, computer])
+        article = self.Article(id=1)
+        article.author = person1
+        self.session.add_all([person1, person2, article])
         self.session.commit()
         data = dict(data=dict(type='person', id='2'))
-        response = self.app.put('/api/computer/1/links/owner',
+        response = self.app.put('/api/article/1/links/author',
                                 data=dumps(data))
         assert response.status_code == 204
-        assert computer.owner is person2
+        assert article.author is person2
 
     def test_remove_to_one(self):
         """Tests for removing a to-one relationship via a :http:method:`put`
@@ -1435,15 +1533,15 @@ class TestUpdatingRelationships(TestSupport):
         """
         person1 = self.Person(id=1)
         person2 = self.Person(id=2)
-        computer = self.Computer(id=1)
-        computer.owner = person1
-        self.session.add_all([person1, person2, computer])
+        article = self.Article(id=1)
+        article.author = person1
+        self.session.add_all([person1, person2, article])
         self.session.commit()
         data = dict(data=None)
-        response = self.app.put('/api/computer/1/links/owner',
+        response = self.app.put('/api/article/1/links/author',
                                 data=dumps(data))
         assert response.status_code == 204
-        assert computer.owner is None
+        assert article.author is None
 
     def test_to_many(self):
         """Tests for replacing a to-many relationship via a :http:method:`put`
@@ -1456,18 +1554,18 @@ class TestUpdatingRelationships(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        self.session.add_all([person, article1, article2])
         self.session.commit()
         self.manager.create_api(self.Person, methods=['PUT'],
                                 url_prefix='/api2',
                                 allow_to_many_replacement=True)
-        data = dict(data=dict(type='computer', ids=['1', '2']))
-        response = self.app.put('/api2/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=['1', '2']))
+        response = self.app.put('/api2/person/1/links/articles',
                                 data=dumps(data))
         assert response.status_code == 204
-        assert set(person.computers) == {computer1, computer2}
+        assert set(person.articles) == {article1, article2}
 
     def test_to_many_not_found(self):
         """Tests that an attempt to replace a to-many relationship with a
@@ -1480,14 +1578,14 @@ class TestUpdatingRelationships(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        self.session.add_all([person, article])
         self.session.commit()
         self.manager.create_api(self.Person, methods=['PUT'],
                                 url_prefix='/api2',
                                 allow_to_many_replacement=True)
-        data = dict(data=dict(type='computer', ids=['1', '2']))
-        response = self.app.put('/api2/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=['1', '2']))
+        response = self.app.put('/api2/person/1/links/articles',
                                 data=dumps(data))
         assert response.status_code == 404
         # TODO test error messages
@@ -1505,8 +1603,8 @@ class TestUpdatingRelationships(TestSupport):
         person = self.Person(id=1)
         self.session.add(person)
         self.session.commit()
-        data = dict(data=dict(type='computer', ids=[]))
-        response = self.app.put('/api/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=[]))
+        response = self.app.put('/api/person/1/links/articles',
                                 data=dumps(data))
         assert response.status_code == 403
         # TODO test error messages
@@ -1522,15 +1620,15 @@ class TestUpdatingRelationships(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        self.session.add_all([person, article1, article2])
         self.session.commit()
-        data = dict(data=dict(type='computer', ids=['1', '2']))
-        response = self.app.post('/api/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=['1', '2']))
+        response = self.app.post('/api/person/1/links/articles',
                                  data=dumps(data))
         assert response.status_code == 204
-        assert set(person.computers) == {computer1, computer2}
+        assert set(person.articles) == {article1, article2}
 
     def test_to_many_preexisting(self):
         """Tests for attempting to append an element that already exists in a
@@ -1544,15 +1642,15 @@ class TestUpdatingRelationships(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        person.computers = [computer]
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        person.articles = [article]
+        self.session.add_all([person, article])
         self.session.commit()
-        data = dict(data=dict(type='computer', ids=['1']))
-        response = self.app.post('/api/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=['1']))
+        response = self.app.post('/api/person/1/links/articles',
                                  data=dumps(data))
         assert response.status_code == 204
-        assert person.computers == [computer]
+        assert person.articles == [article]
 
     def test_to_many_delete(self):
         """Tests for deleting from a to-many relationship via a
@@ -1565,19 +1663,19 @@ class TestUpdatingRelationships(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        person.computers = [computer1, computer2]
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        person.articles = [article1, article2]
+        self.session.add_all([person, article1, article2])
         self.session.commit()
         self.manager.create_api(self.Person, methods=['DELETE'],
                                 url_prefix='/api2',
                                 allow_delete_from_to_many_relationships=True)
-        data = dict(data=dict(type='computer', ids=['1']))
-        response = self.app.delete('/api2/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=['1']))
+        response = self.app.delete('/api2/person/1/links/articles',
                                    data=dumps(data))
         assert response.status_code == 204
-        assert person.computers == [computer2]
+        assert person.articles == [article2]
 
     def test_to_many_delete_nonexistent(self):
         """Tests for deleting a nonexistent member from a to-many relationship
@@ -1590,19 +1688,19 @@ class TestUpdatingRelationships(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer1 = self.Computer(id=1)
-        computer2 = self.Computer(id=2)
-        person.computers = [computer1]
-        self.session.add_all([person, computer1, computer2])
+        article1 = self.Article(id=1)
+        article2 = self.Article(id=2)
+        person.articles = [article1]
+        self.session.add_all([person, article1, article2])
         self.session.commit()
         self.manager.create_api(self.Person, methods=['DELETE'],
                                 url_prefix='/api2',
                                 allow_delete_from_to_many_relationships=True)
-        data = dict(data=dict(type='computer', ids=['2']))
-        response = self.app.delete('/api2/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=['2']))
+        response = self.app.delete('/api2/person/1/links/articles',
                                    data=dumps(data))
         assert response.status_code == 204
-        assert person.computers == [computer1]
+        assert person.articles == [article1]
 
     def test_to_many_delete_forbidden(self):
         """Tests that attempting to delete from a to-many relationship via a
@@ -1616,18 +1714,18 @@ class TestUpdatingRelationships(TestSupport):
 
         """
         person = self.Person(id=1)
-        computer = self.Computer(id=1)
-        person.computers = [computer]
-        self.session.add_all([person, computer])
+        article = self.Article(id=1)
+        person.articles = [article]
+        self.session.add_all([person, article])
         self.session.commit()
-        data = dict(data=dict(type='computer', ids=['1']))
-        response = self.app.delete('/api/person/1/links/computers',
+        data = dict(data=dict(type='article', ids=['1']))
+        response = self.app.delete('/api/person/1/links/articles',
                                    data=dumps(data))
         assert response.status_code == 403
-        assert person.computers == [computer]
+        assert person.articles == [article]
 
 
-class TestDeletingResources(TestSupport):
+class TestDeletingResources(ManagerTestBase):
     """Tests corresponding to the `Deleting Resources`_ section of the JSON API
     specification.
 
@@ -1644,13 +1742,20 @@ class TestDeletingResources(TestSupport):
         """
         # create the database
         super(TestDeletingResources, self).setUp()
+
+        class Person(self.Base):
+            __tablename__ = 'person'
+            id = Column(Integer, primary_key=True)
+
+        self.Person = Person
+        self.Base.metadata.create_all()
         self.manager.create_api(self.Person, methods=['DELETE'])
 
     def test_delete(self):
         """Tests for deleting a resource.
 
-        For more information, see the `Deleting Resources`_ section of the JSON API
-        specification.
+        For more information, see the `Deleting Resources`_ section of the JSON
+        API specification.
 
         .. _Deleting Resources: http://jsonapi.org/format/#crud-deleting
 
@@ -1663,7 +1768,8 @@ class TestDeletingResources(TestSupport):
         assert self.session.query(self.Person).count() == 0
 
     def test_delete_nonexistent(self):
-        """Tests that deleting a nonexistent resource causes a :http:status:`404`.
+        """Tests that deleting a nonexistent resource causes a
+        :http:status:`404`.
 
         For more information, see the `404 Not Found`_ section of the JSON API
         specification.
