@@ -28,7 +28,6 @@ from collections import defaultdict
 from functools import wraps
 from itertools import chain
 import math
-import warnings
 
 from flask import current_app
 from flask import json
@@ -41,8 +40,8 @@ from sqlalchemy.exc import DataError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.ext.associationproxy import AssociationProxy
-from sqlalchemy.orm.attributes import InstrumentedAttribute
+# from sqlalchemy.ext.associationproxy import AssociationProxy
+# from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.orm.exc import FlushError
 from sqlalchemy.orm.exc import MultipleResultsFound
 from sqlalchemy.orm.exc import NoResultFound
@@ -55,7 +54,6 @@ from .helpers import count
 from .helpers import evaluate_functions
 from .helpers import get_by
 from .helpers import get_columns
-from .helpers import get_model
 from .helpers import get_or_create
 from .helpers import get_related_model
 from .helpers import get_relations
@@ -65,21 +63,18 @@ from .helpers import model_for
 from .helpers import partition
 from .helpers import primary_key_name
 from .helpers import primary_key_value
-from .helpers import query_by_primary_key
 from .helpers import session_query
 from .helpers import strings_to_dates
 from .helpers import to_dict
 from .helpers import upper_keys
 from .helpers import url_for
-from .helpers import get_related_association_proxy_model
-#from .search import create_query
+# from .helpers import get_related_association_proxy_model
+# from .search import create_query
 from .search import search
 
 
+#: Format string for creating the complete URL for a paginated response.
 LINKTEMPLATE = '{0}?page[number]={1}&page[size]={2}'
-
-#: Format string for creating Link headers in paginated responses.
-#LINKTEMPLATE = '<{0}?page[number]={1}&page[size]={2}>; rel="{3}"'
 
 #: String used internally as a dictionary key for passing header information
 #: from view functions to the :func:`jsonpify` function.
@@ -90,6 +85,9 @@ _HEADERS = '__restless_headers'
 _STATUS = '__restless_status_code'
 
 #: The Content-Type we expect for most requests to APIs.
+#:
+#: The JSON API specification requires the content type to be
+#: ``application/vnd.api+json``.
 CONTENT_TYPE = 'application/vnd.api+json'
 
 #: SQLAlchemy errors that, when caught, trigger a rollback of the session.
@@ -146,31 +144,6 @@ def _is_msie8or9():
             and (8, 0) <= version(request.user_agent) < (10, 0))
 
 
-def dict_union(d1, d2):
-    result = defaultdict(set)
-    for k, v in chain(d1.items(), d2.items()):
-        result[k] |= v
-    # Don't want the returned object to be a defaultdict.
-    return dict(result)
-
-
-def create_link_string(page, last_page, per_page):
-    """Returns a string representing the value of the ``Link`` header.
-
-    `page` is the number of the current page, `last_page` is the last page in
-    the pagination, and `per_page` is the number of results per page.
-
-    """
-    linkstring = ''
-    if page < last_page:
-        next_page = page + 1
-        linkstring = LINKTEMPLATE.format(request.base_url, next_page,
-                                         per_page, 'next') + ', '
-    linkstring += LINKTEMPLATE.format(request.base_url, last_page,
-                                      per_page, 'last')
-    return linkstring
-
-
 def catch_processing_exceptions(func):
     """Decorator that catches :exc:`ProcessingException`s and subsequently
     returns a JSON-ified error response.
@@ -186,13 +159,6 @@ def catch_processing_exceptions(func):
             message = exception.description or str(exception)
             return jsonify(message=message), status
     return decorator
-
-
-# def add_self_link(data, model, *args, **kw):
-#     # The remaining args and keywords go directly to url_for
-#     if 'links' not in data:
-#         data['links'] = {}
-#     data['links']['self'] = url_for(model, *args, **kw)
 
 
 def catch_integrity_errors(session):
@@ -519,30 +485,6 @@ def errors_response(status, errors):
 
     """
     return {'errors': errors, _STATUS: status}, status
-
-
-# def linked_resources(resource):
-#     """Returns an iterator over (type, id) pairs for each resource linked to
-#     the specified resource.
-
-#     `resource` is a dictionary representation of a SQLAlchemy instance, as
-#     would be returned on a :http:method:`get` request for a single instance of
-#     a model.
-
-#     `resource` must have a ``'links'`` mapping containing link objects, each of
-#     which must have either an ``'id'`` or an ``'ids'`` mapping.
-
-#     """
-#     # Iterate over each link object and collect the IDs of each one.
-#     for link_object in resource['links'].values():
-#         type_ = link_object['type']
-#         if 'ids' in link_object:
-#             for id_ in link_object['ids']:
-#                 yield type_, id_
-#         elif 'id' in link_object:
-#             yield type_, link_object['id']
-#         else:
-#             raise ValueError('Link object must have an "id" or "ids" key.')
 
 
 #: Creates the mimerender object necessary for decorating responses with a
@@ -1139,16 +1081,6 @@ class API(APIBase):
             relations &= (cols | rels)
         elif self.exclude_columns is not None:
             relations -= frozenset(self.exclude_columns)
-        # Check if the client requested only a specified subset of columns to
-        # be included.
-        # fields = request.args.get('fields', None)
-        # if fields is not None:
-        #     fields = fields.split(',')
-        # if fields is None and self.include_columns is None:
-        #     includes = None
-        # else:
-        #     includes = fields + (self.include_columns or [])
-        #deep = dict((r, {}) for r in relations)
         # Always include at least the type and ID, regardless of what the user
         # requested.
         if only is not None:
@@ -1157,7 +1089,6 @@ class API(APIBase):
             if 'id' not in only:
                 only.add('id')
         result = to_dict(inst, only)
-        #add_self_link(result, get_model(inst), primary_key_value(inst))
         return result
 
     def _dict_to_inst(self, data):
@@ -1295,9 +1226,6 @@ class API(APIBase):
         #     detail = 'Unable to decode sorting data as JSON'
         #     return error_response(400, detail=detail)
 
-        for preprocessor in self.preprocessors['GET_MANY']:
-            preprocessor(sorting=sorting)
-
         # # resolve date-strings as required by the model
         # for param in search_params.get('filters', list()):
         #     if 'name' in param and 'val' in param:
@@ -1331,6 +1259,9 @@ class API(APIBase):
         if any(order not in ('+', '-') for order, field in sort):
             detail = 'Each sort parameter must begin with "+" or "-".'
             return error_response(400, detail=detail)
+
+        for preprocessor in self.preprocessors['GET_MANY']:
+            preprocessor(sort=sort)
 
         # Compute the result of the search on the model.
         try:
@@ -1428,8 +1359,13 @@ class API(APIBase):
                                                  ('last', last_url),
                                                  ('prev', prev_url),
                                                  ('next', next_url)))
-                headers = [('Link', link) for link in link_strings
-                           if link is not None]
+                # TODO Should this be multiple header fields, like this::
+                #
+                #     headers = [('Link', link) for link in link_strings
+                #                if link is not None]
+                #
+                headers = dict(Link=','.join(link for link in link_strings
+                                             if link is not None))
         # Otherwise, the result of the search was a single resource.
         else:
             primary_key = self.primary_key or primary_key_name(result)
@@ -1442,9 +1378,6 @@ class API(APIBase):
         # Wrap the resulting object or list of objects under a `data` key.
         result = dict(data=result)
 
-        for postprocessor in self.postprocessors['GET_MANY']:
-            postprocessor(result=result, search_params=search_params)
-
         # Provide top-level links.
         #
         # TODO use a defaultdict for result, then cast it to a dict at the end.
@@ -1452,17 +1385,9 @@ class API(APIBase):
             result['links'] = dict()
         result['links']['self'] = url_for(self.model)
         result['links'].update(pagination_links)
-        # for relation in get_relations(self.model):
-        #     linkname = '{0}.{1}'.format(self.collection_name, relation)
-        #     related_model = get_related_model(self.model, relation)
-        #     try:
-        #         links[linkname] = url_for(related_model)
-        #     except:
-        #         # TODO Undocumented behavior here: if no API has been created
-        #         # for the model, then simply don't provide a link for it.
-        #         pass
-        # if links:
-        #     result['links'] = links
+
+        for postprocessor in self.postprocessors['GET_MANY']:
+            postprocessor(result=result, sort=sort)
 
         # HACK Provide the headers directly in the result dictionary, so that
         # the :func:`jsonpify` function has access to them. See the note there
@@ -1501,7 +1426,6 @@ class API(APIBase):
             related_value = getattr(instance, relationname)
             # create a placeholder for the relations of the returned models
             related_model = get_related_model(self.model, relationname)
-            relations = frozenset(get_relations(related_model))
             # Determine fields to include for this model.
             fields_for_this = fields.get(collection_name(related_model))
             if relationinstid is not None:
@@ -1519,8 +1443,8 @@ class API(APIBase):
                     #
                     #     result = self._paginated(list(related_value), deep)
                     #
-                    result = [self.serialize(instance, only=fields_for_this)
-                              for instance in related_value]
+                    result = [self.serialize(inst, only=fields_for_this)
+                              for inst in related_value]
                 else:
                     result = self.serialize(related_value, fields_for_this)
         if result is None:
@@ -1531,7 +1455,7 @@ class API(APIBase):
         ids_to_link = self.links_to_add(result)
         for link, linkids in ids_to_link.items():
             related_model = model_for(link)
-            related_instances = list(get_by(self.session, related_model,
+            related_instances = (get_by(self.session, related_model,
                                         link_id) for link_id in linkids)
             # Determine which fields to include in the linked objects.
             fields_for_this = fields.get(link)
@@ -1765,8 +1689,9 @@ class API(APIBase):
             else:
                 # If there is no link there to delete, return an error.
                 if getattr(inst, relationname) is None:
-                    msg = 'No linked instance to delete: {0}'.format(relationname)
-                    return dict(message=msg), 400
+                    detail = ('No linked instance to delete:'
+                              ' {0}').format(relationname)
+                    return error_response(400, detail=detail)
                 # TODO this doesn't apply to a many-to-one endpoint applies
                 #
                 # if not relationinstid:
@@ -1950,7 +1875,7 @@ class API(APIBase):
                 # Get the dictionary representation of the new instance as it
                 # appears in the database.
                 if has_many:
-                    result = [self.serialize(instance) for instance in instances]
+                    result = [self.serialize(inst) for inst in instances]
                 else:
                     result = self.serialize(instance)
             except self.validation_exceptions as exception:
@@ -1958,8 +1883,8 @@ class API(APIBase):
             # Determine the value of the primary key for this instance and
             # encode URL-encode it (in case it is a Unicode string).
             if has_many:
-                primary_keys = [primary_key_value(instance, as_string=True)
-                                for instance in instances]
+                primary_keys = [primary_key_value(inst, as_string=True)
+                                for inst in instances]
             else:
                 primary_key = primary_key_value(instance, as_string=True)
             # The URL at which a client can access the newly created instance
@@ -1970,6 +1895,12 @@ class API(APIBase):
             else:
                 url = '{0}/{1}'.format(request.base_url, primary_key)
             # Provide that URL in the Location header in the response.
+            #
+            # TODO should the many Location header fields be combined into a
+            # single comma-separated header field::
+            #
+            #     headers = dict(Location=', '.join(urls))
+            #
             if has_many:
                 headers = (('Location', url) for url in urls)
             else:
@@ -1991,9 +1922,9 @@ class API(APIBase):
             if link is None:
                 setattr(instance, linkname, None)
                 continue
-            type_ = link['type']
             # TODO check for conflicting or missing types here
-            #
+            # type_ = link['type']
+
             # If this is a to-one relationship, just get the single related
             # resource. If it is a to-many relationship, get all the related
             # resources.
@@ -2059,16 +1990,12 @@ class API(APIBase):
             except self.validation_exceptions as exception:
                 current_app.logger.exception(str(exception))
                 return self._handle_validation_exception(exception)
-        #field_list = frozenset(data) ^ relations
-        #data = dict((field, data[field]) for field in field_list)
-
         # Special case: if there are any dates, convert the string form of the
         # date into an instance of the Python ``datetime`` object.
         data = strings_to_dates(self.model, data)
-
+        # Try to update all instances present in the query.
+        num_modified = 0
         try:
-            # Let's update all instances present in the query
-            num_modified = 0
             if data:
                 for field, value in data.items():
                     setattr(instance, field, value)
@@ -2127,28 +2054,12 @@ class API(APIBase):
             # this also happens when request.data is empty
             current_app.logger.exception(str(exception))
             return dict(message='Unable to decode data'), 400
-        # # Check if the request is to patch many instances of the current model.
-        # putmany = instid is None
-        # # Perform any necessary preprocessing.
-        # if putmany:
-        #     # Get the search parameters; all other keys in the `data`
-        #     # dictionary indicate a change in the model's field.
-        #     search_params = data.pop('q', {})
-        #     for preprocessor in self.preprocessors['PUT_MANY']:
-        #         preprocessor(search_params=search_params, data=data)
-        # else:
         for preprocessor in self.preprocessors['PUT_SINGLE']:
             temp_result = preprocessor(instance_id=instid, data=data)
             # See the note under the preprocessor in the get() method.
             if temp_result is not None:
                 instid = temp_result
         # Get the instance on which to set the new attributes.
-        # if ',' in instid:
-        #     ids = instid.split(',')
-        #     #instances = [get_by(self.session, self.model, id_) for id_ in ids]
-        # else:
-        #    ids = instid
-        #    #instances = get_by(self.session, self.model, instid)
         instance = get_by(self.session, self.model, instid, self.primary_key)
         # If no instance of the model exists with the specified instance ID,
         # return a 404 response.
@@ -2199,14 +2110,14 @@ class API(APIBase):
                 return error_response(409, detail=message)
             # If we are attempting to update multiple objects.
             # if isinstance(data, list):
-            #     # Check that the IDs specified in the body of the request match
-            #     # the IDs specified in the URL.
+            #     # Check that the IDs specified in the body of the request
+            #     # match the IDs specified in the URL.
             #     if not all('id' in d and str(d['id']) in ids for d in data):
             #         msg = 'IDs in body of request must match IDs in URL'
             #         return dict(message=msg), 400
             #     for newdata in data:
-            #         instance = get_by(self.session, self.model, newdata['id'],
-            #                           self.primary_key)
+            #         instance = get_by(self.session, self.model,
+            #                           newdata['id'], self.primary_key)
             #         self._update_single(instance, newdata)
             # else:
             # instance = get_by(self.session, self.model, instid,
@@ -2217,19 +2128,9 @@ class API(APIBase):
             if result is not None:
                 return result
         # Perform any necessary postprocessing.
-        # if putmany:
-        #     for postprocessor in self.postprocessors['PUT_MANY']:
-        #         postprocessor(query=query, num_modified=num_modified,
-        #                       search_params=search_params)
-        #     return {}, 204
-        #result = self._instid_to_dict(instid)
         for postprocessor in self.postprocessors['PUT_SINGLE']:
             postprocessor()
         return {}, 204
-
-    def patch(self, *args, **kw):
-        """Alias for :meth:`patch`."""
-        return {'message': 'Not implemented'}
 
 
 class RelationshipAPI(APIBase):
@@ -2237,7 +2138,8 @@ class RelationshipAPI(APIBase):
     def __init__(self, *args, allow_delete_from_to_many_relationships=False,
                  **kw):
         super(RelationshipAPI, self).__init__(*args, **kw)
-        self.allow_delete_from_to_many_relationships = allow_delete_from_to_many_relationships
+        self.allow_delete_from_to_many_relationships = \
+            allow_delete_from_to_many_relationships
 
     def post(self, instid, relationname):
         # Request must have the Content-Type: application/vnd.api+json header,
@@ -2372,7 +2274,8 @@ class RelationshipAPI(APIBase):
                                                                   relationname)
             return error_response(404, detail=detail)
         related_model = get_related_model(self.model, relationname)
-        related_value = getattr(instance, relationname)
+        # related_value = getattr(instance, relationname)
+
         # Unwrap the data from the request.
         data = data.pop('data', {})
         # If the client sent a null value, we assume it wants to remove a
@@ -2394,11 +2297,11 @@ class RelationshipAPI(APIBase):
                 detail = ('Type must be {0}, not'
                           ' {1}').format(collection_name(related_model), type_)
                 return error_response(409, detail=detail)
-            # If there is just an 'id' key, we assume the client is trying to set a
-            # to-one relationship.
+            # If there is just an 'id' key, we assume the client is trying to
+            # set a to-one relationship.
             if 'id' in data:
                 id_ = data.pop('id')
-                # The new value with which to replace the current related value.
+                # The new value with which to replace the current related value
                 replacement = get_by(self.session, related_model, id_)
             # If there is an 'ids' key, we assume the client is trying to set a
             # to-many relationship.
@@ -2409,7 +2312,7 @@ class RelationshipAPI(APIBase):
                     message = 'Not allowed to replace a to-many relationship'
                     return error_response(403, detail=message)
                 ids = data.pop('ids')
-                # The new value with which to replace the current related value.
+                # The new value with which to replace the current related value
                 replacement = [get_by(self.session, related_model, id_)
                                for id_ in ids]
             else:
@@ -2421,8 +2324,8 @@ class RelationshipAPI(APIBase):
                 detail = ('No object of type {0} found'
                           ' with ID {1}').format(type_, id_)
                 return error_response(404, detail=detail)
-            elif isinstance(replacement, list) and any(value is None
-                                                       for value in replacement):
+            if (isinstance(replacement, list)
+                and any(value is None for value in replacement)):
                 not_found = (id_ for id_, value in zip(ids, replacement)
                              if value is None)
                 msg = 'No object of type {0} found with ID {1}'
@@ -2494,7 +2397,7 @@ class RelationshipAPI(APIBase):
         if 'ids' not in data:
             detail = 'Must specify resource IDs'
             return error_response(400, detail=detail)
-        type_ = data['type']
+        # type_ = data['type']
         ids = data['ids']
         toremove = set(get_by(self.session, related_model, id_) for id_ in ids)
         for obj in toremove:
