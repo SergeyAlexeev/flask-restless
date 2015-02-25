@@ -1372,53 +1372,64 @@ class API(APIBase):
                 detail = "Page size must not exceed the server's maximum: {0}"
                 detail = detail.format(self.max_page_size)
                 return error_response(400, detail=detail)
-            page_number = int(request.args.get('page[number]', 1))
-            if page_number < 0:
-                detail = 'Page number must be a positive integer'
-                return error_response(400, detail=detail)
-            print(page_size, page_number)
-            # If the query is really a Flask-SQLAlchemy query, we can use the
-            # its built-in pagination.
-            if hasattr(result, 'paginate'):
-                pagination = result.paginate(page_number, page_size,
-                                             error_out=False)
-                first = 1
-                last = pagination.pages
-                prev = pagination.prev_num
-                next_ = pagination.next_num
-                result = [self.serialize(instance, only=fields) for instance in
-                          pagination.items()]
-            else:
-                num_results = count(self.session, result)
-                first = 1
-                last = int(math.ceil(num_results / page_size))
-                prev = page_number - 1 if page_number > 1 else None
-                next_ = page_number + 1 if page_number < last else None
-                offset = (page_number - 1) * page_size
-                result = result.limit(page_size).offset(offset)
+            # If the page size is 0, just return everything.
+            pagination_links = dict()
+            if page_size == 0:
+                headers = dict()
                 result = [self.serialize(instance, only=fields)
                           for instance in result]
-            # Create the pagination link URLs
-            #
-            # TODO pagination needs to respect sorting, fields, etc., so these
-            # link template strings are not quite right.
-            base_url = request.base_url
-            link_urls = (LINKTEMPLATE.format(base_url, num, page_size)
-                         if num is not None else None
-                         for rel, num in (('first', first), ('last', last),
-                                          ('prev', prev), ('next', next_)))
-            first_url, last_url, prev_url, next_url = link_urls
-            # Make them available for the result dictionary later.
-            pagination_links = dict(first=first_url, last=last_url,
-                                    prev=prev_url, next=next_url)
-            link_strings = ('<{0}>; rel="{1}"'.format(url, rel)
-                            if url is not None else None
-                            for rel, url in (('first', first_url),
-                                             ('last', last_url),
-                                             ('prev', prev_url),
-                                             ('next', next_url)))
-            headers = [('Link', link) for link in link_strings
-                       if link is not None]
+            # Otherwise, the page size is greater than zero, so paginate the
+            # response.
+            else:
+                page_number = int(request.args.get('page[number]', 1))
+                if page_number < 0:
+                    detail = 'Page number must be a positive integer'
+                    return error_response(400, detail=detail)
+                # If the query is really a Flask-SQLAlchemy query, we can use
+                # the its built-in pagination.
+                if hasattr(result, 'paginate'):
+                    pagination = result.paginate(page_number, page_size,
+                                                 error_out=False)
+                    first = 1
+                    last = pagination.pages
+                    prev = pagination.prev_num
+                    next_ = pagination.next_num
+                    result = [self.serialize(instance, only=fields)
+                              for instance in pagination.items()]
+                else:
+                    num_results = count(self.session, result)
+                    first = 1
+                    # There will be no division-by-zero error here because we
+                    # have already checked that page size is not equal to zero
+                    # above.
+                    last = int(math.ceil(num_results / page_size))
+                    prev = page_number - 1 if page_number > 1 else None
+                    next_ = page_number + 1 if page_number < last else None
+                    offset = (page_number - 1) * page_size
+                    result = result.limit(page_size).offset(offset)
+                    result = [self.serialize(instance, only=fields)
+                              for instance in result]
+                # Create the pagination link URLs
+                #
+                # TODO pagination needs to respect sorting, fields, etc., so
+                # these link template strings are not quite right.
+                base_url = request.base_url
+                link_urls = (LINKTEMPLATE.format(base_url, num, page_size)
+                             if num is not None else None
+                             for rel, num in (('first', first), ('last', last),
+                                              ('prev', prev), ('next', next_)))
+                first_url, last_url, prev_url, next_url = link_urls
+                # Make them available for the result dictionary later.
+                pagination_links = dict(first=first_url, last=last_url,
+                                        prev=prev_url, next=next_url)
+                link_strings = ('<{0}>; rel="{1}"'.format(url, rel)
+                                if url is not None else None
+                                for rel, url in (('first', first_url),
+                                                 ('last', last_url),
+                                                 ('prev', prev_url),
+                                                 ('next', next_url)))
+                headers = [('Link', link) for link in link_strings
+                           if link is not None]
         # Otherwise, the result of the search was a single resource.
         else:
             primary_key = self.primary_key or primary_key_name(result)

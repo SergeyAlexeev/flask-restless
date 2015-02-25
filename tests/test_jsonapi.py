@@ -330,10 +330,13 @@ class TestPagination(TestSupport):
         response = self.app.get('/api/person')
         document = loads(response.data)
         pagination = document['links']
-        assert pagination['first'] == 1
-        assert pagination['last'] == 3
-        assert pagination['prev'] == None
-        assert pagination['next'] == 2
+        assert '/api/person?' in pagination['first']
+        assert 'page[number]=1' in pagination['first']
+        assert '/api/person?' in pagination['last']
+        assert 'page[number]=3' in pagination['last']
+        assert pagination['prev'] is None
+        assert '/api/person?' in pagination['next']
+        assert 'page[number]=2' in pagination['next']
         assert len(document['data']) == 10
 
     def test_client_page_and_size(self):
@@ -352,10 +355,14 @@ class TestPagination(TestSupport):
         response = self.app.get('/api/person?page[number]=2&page[size]=3')
         document = loads(response.data)
         pagination = document['links']
-        assert pagination['first'] == 1
-        assert pagination['last'] == 9
-        assert pagination['prev'] == 2
-        assert pagination['next'] == 4
+        assert '/api/person?' in pagination['first']
+        assert 'page[number]=1' in pagination['first']
+        assert '/api/person?' in pagination['last']
+        assert 'page[number]=9' in pagination['last']
+        assert '/api/person?' in pagination['prev']
+        assert 'page[number]=1' in pagination['prev']
+        assert '/api/person?' in pagination['next']
+        assert 'page[number]=3' in pagination['next']
         assert len(document['data']) == 3
 
     def test_client_number_only(self):
@@ -374,10 +381,14 @@ class TestPagination(TestSupport):
         response = self.app.get('/api/person?page[number]=2')
         document = loads(response.data)
         pagination = document['links']
-        assert pagination['first'] == 1
-        assert pagination['last'] == 3
-        assert pagination['prev'] == 1
-        assert pagination['next'] == 3
+        assert '/api/person?' in pagination['first']
+        assert 'page[number]=1' in pagination['first']
+        assert '/api/person?' in pagination['last']
+        assert 'page[number]=3' in pagination['last']
+        assert '/api/person?' in pagination['prev']
+        assert 'page[number]=1' in pagination['prev']
+        assert '/api/person?' in pagination['next']
+        assert 'page[number]=3' in pagination['next']
         assert len(document['data']) == 10
 
     def test_client_size_only(self):
@@ -396,10 +407,13 @@ class TestPagination(TestSupport):
         response = self.app.get('/api/person?page[size]=5')
         document = loads(response.data)
         pagination = document['links']
-        assert pagination['first'] == 1
-        assert pagination['last'] == 5
-        assert pagination['prev'] == None
-        assert pagination['next'] == 2
+        assert '/api/person?' in pagination['first']
+        assert 'page[number]=1' in pagination['first']
+        assert '/api/person?' in pagination['last']
+        assert 'page[number]=5' in pagination['last']
+        assert pagination['prev'] is None
+        assert '/api/person?' in pagination['next']
+        assert 'page[number]=2' in pagination['next']
         assert len(document['data']) == 5
 
     def test_short_page(self):
@@ -424,7 +438,7 @@ class TestPagination(TestSupport):
         assert 'page[number]=3' in pagination['last']
         assert '/api/person?' in pagination['prev']
         assert 'page[number]=2' in pagination['prev']
-        assert pagination['next'] == None
+        assert pagination['next'] is None
         assert len(document['data']) == 5
 
     def test_server_page_size(self):
@@ -443,10 +457,14 @@ class TestPagination(TestSupport):
         response = self.app.get('/api2/person?page[number]=3')
         document = loads(response.data)
         pagination = document['links']
-        assert pagination['first'] == 1
-        assert pagination['last'] == 5
-        assert pagination['prev'] == 2
-        assert pagination['next'] == 4
+        assert '/api2/person?' in pagination['first']
+        assert 'page[number]=1' in pagination['first']
+        assert '/api2/person?' in pagination['last']
+        assert 'page[number]=5' in pagination['last']
+        assert '/api2/person?' in pagination['prev']
+        assert 'page[number]=2' in pagination['prev']
+        assert '/api2/person?' in pagination['next']
+        assert 'page[number]=4' in pagination['next']
         assert len(document['data']) == 5
 
     def test_disable_pagination(self):
@@ -485,7 +503,7 @@ class TestPagination(TestSupport):
         self.session.add_all(people)
         self.session.commit()
         self.manager.create_api(self.Person, url_prefix='/api2', page_size=0)
-        response = self.app.get('/api2/person&page[number]=2')
+        response = self.app.get('/api2/person?page[number]=2')
         document = loads(response.data)
         pagination = document['links']
         assert 'first' not in pagination
@@ -906,17 +924,6 @@ class TestFetchingResources(TestSupport):
         document = loads(response.data)
         computers = document['data']
         assert ['2', '1', '3'] == [c['id'] for c in computers]
-
-    def test_pagination(self):
-        """Tests that the client receives pagination links.
-
-        For more information, see the `Pagination`_ section of the JSON API
-        specification.
-
-        .. _Pagination: http://jsonapi.org/format/#fetching-pagination
-
-        """
-        assert False, 'Not implemented'
 
     def test_filtering(self):
         """Tests that the client can specify filters.
