@@ -25,6 +25,7 @@ import datetime
 import uuid
 
 from flask import Flask
+from flask import json
 from nose import SkipTest
 from sqlalchemy import Boolean
 from sqlalchemy import Column
@@ -56,8 +57,21 @@ try:
 except ImportError:
     flask_sa = None
 
-
 from flask.ext.restless import APIManager
+from flask.ext.restless import CONTENT_TYPE
+
+dumps = json.dumps
+loads = json.loads
+
+#: The User-Agent string for Microsoft Internet Explorer 8.
+#:
+#: From <http://blogs.msdn.com/b/ie/archive/2008/02/21/the-internet-explorer-8-user-agent-string.aspx>.
+MSIE8_UA = 'Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.0; Trident/4.0)'
+
+#: The User-Agent string for Microsoft Internet Explorer 9.
+#:
+#: From <http://blogs.msdn.com/b/ie/archive/2010/03/23/introducing-ie9-s-user-agent-string.aspx>.
+MSIE9_UA = 'Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)'
 
 
 def skip_unless(condition, reason=None):
@@ -121,10 +135,14 @@ def force_json_contenttype(test_client):
     """
     # Create a decorator for the test client request methods that adds
     # a JSON Content-Type by default if none is specified.
-    def set_content_type(func, content_type='application/vnd.api+json'):
+    def set_content_type(func, headers=None, content_type=CONTENT_TYPE):
         def new_func(*args, **kw):
             if 'content_type' not in kw:
                 kw['content_type'] = content_type
+            if 'headers' not in kw:
+                kw['headers'] = dict()
+            if 'Accept' not in kw['headers']:
+                kw['headers']['Accept'] = CONTENT_TYPE
             return func(*args, **kw)
         return new_func
 

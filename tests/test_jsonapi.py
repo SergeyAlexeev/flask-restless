@@ -23,11 +23,10 @@ from sqlalchemy import ForeignKey
 from sqlalchemy import Unicode
 from sqlalchemy.orm import relationship
 
+from .helpers import dumps
+from .helpers import loads
 from .helpers import ManagerTestBase
 from .helpers import GUID
-
-loads = json.loads
-dumps = json.dumps
 
 
 class TestDocumentStructure(ManagerTestBase):
@@ -64,6 +63,7 @@ class TestDocumentStructure(ManagerTestBase):
         self.manager.create_api(Article)
         self.manager.create_api(Person)
 
+    # TODO refactor this so that it lives in a superclass.
     def tearDown(self):
         """Drops all tables from the temporary database."""
         self.Base.metadata.drop_all()
@@ -593,10 +593,6 @@ class TestPagination(ManagerTestBase):
                    for l in links)
 
 
-class TestFiltering(ManagerTestBase):
-    pass
-
-
 class TestFetchingResources(ManagerTestBase):
     """Tests corresponding to the `Fetching Resources`_ section of the JSON API
     specification.
@@ -652,6 +648,52 @@ class TestFetchingResources(ManagerTestBase):
     def tearDown(self):
         """Drops all tables from the temporary database."""
         self.Base.metadata.drop_all()
+
+    def test_correct_accept_header(self):
+        """Tests that the server responds with a resource if the ``Accept``
+        header specifies the JSON API media type.
+
+        For more information, see the `Fetching Resources`_ section of the JSON
+        API specification.
+
+        .. _Fetching Resources: http://jsonapi.org/format/#fetching
+
+        """
+        # The fixtures for this test class set up the correct `Accept` header
+        # for all requests from the test client.
+        response = self.app.get('/api/person')
+        assert response.status_code == 200
+        assert response.mimetype == CONTENT_TYPE
+
+    def test_incorrect_accept_header(self):
+        """Tests that the server responds with an :http:status:`415` if the
+        ``Accept`` header is incorrect.
+
+        For more information, see the `Fetching Resources`_ section of the JSON
+        API specification.
+
+        .. _Fetching Resources: http://jsonapi.org/format/#fetching
+
+        """
+        headers = dict(Accept='application/json')
+        response = self.app.get('/api/person', headers=headers)
+        assert response.status_code == 406
+        assert response.mimetype == CONTENT_TYPE
+
+    def test_missing_accept_header(self):
+        """Tests that the server responds with an :http:status:`415` if the
+        ``Accept`` header is missing.
+
+        For more information, see the `Fetching Resources`_ section of the JSON
+        API specification.
+
+        .. _Fetching Resources: http://jsonapi.org/format/#fetching
+
+        """
+        headers = dict(Accept=None)
+        response = self.app.get('/api/person', headers=headers)
+        assert response.status_code == 406
+        assert response.mimetype == CONTENT_TYPE
 
     def test_to_many(self):
         """Test for fetching resources from a to-many related resource URL."""
